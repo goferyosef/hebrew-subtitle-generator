@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+*.ico
+installer.zip
+.gemini_key
+*.log
