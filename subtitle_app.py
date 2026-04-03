@@ -215,14 +215,19 @@ def extract_soft_subtitles(video_path: str, stream_index: int, out_path: str):
     raise RuntimeError("ffmpeg failed to extract subtitle stream.")
 
 
-# ─── Auto-sync (ffsubsync) ────────────────────────────────────────────────────
+# ─── Auto-sync (ffsubsync / alass) ───────────────────────────────────────────
+
+# alass bundled alongside the app
+_ALASS_EXE = str(Path(__file__).parent / 'alass.exe')
+
 
 def sync_subtitles(video_path: str, srt_path: str, output_path: str, log_cb) -> bool:
     """
-    Align subtitle timing to the movie's audio using ffsubsync.
-    Returns True on success.  Tries CLI first, then Python API.
+    Align subtitle timing to the movie's audio.
+    Tries ffsubsync first, then falls back to alass (bundled binary).
+    Returns True on success.
     """
-    # Try CLI (installed as 'ffs' by pip install ffsubsync)
+    # ── ffsubsync CLI ──
     for cli in ('ffs', 'ffsubsync'):
         try:
             log_cb(f"  Running {cli}…", 'dim')
@@ -241,19 +246,38 @@ def sync_subtitles(video_path: str, srt_path: str, output_path: str, log_cb) -> 
             log_cb("  ffsubsync timed out (>10 min). Try a shorter video clip.", 'error')
             return False
 
-    # Try Python API directly
+    # ── ffsubsync Python API ──
     try:
         from ffsubsync.ffsubsync import make_parser, run as ffs_run   # type: ignore
         parser = make_parser()
         args   = parser.parse_args([video_path, '-i', srt_path, '-o', output_path])
         ffs_run(args)
-        return Path(output_path).exists() and Path(output_path).stat().st_size > 0
+        if Path(output_path).exists() and Path(output_path).stat().st_size > 0:
+            return True
     except ImportError:
-        log_cb("ffsubsync not installed.  Run:  pip install ffsubsync", 'error')
-        return False
+        log_cb("  ffsubsync not installed — trying alass…", 'dim')
     except Exception as e:
-        log_cb(f"ffsubsync API error: {e}", 'error')
+        log_cb(f"  ffsubsync error: {e} — trying alass…", 'warning')
+
+    # ── alass fallback (bundled .exe) ──
+    alass = _ALASS_EXE if Path(_ALASS_EXE).exists() else shutil.which('alass')
+    if not alass:
+        log_cb("  Neither ffsubsync nor alass found. Sync unavailable.", 'error')
         return False
+
+    try:
+        log_cb("  Running alass…", 'dim')
+        r = run_cmd(alass, video_path, srt_path, output_path, timeout=600)
+        if r.returncode == 0 and Path(output_path).exists() and Path(output_path).stat().st_size > 0:
+            log_cb("  alass sync complete.", 'success')
+            return True
+        log_cb(f"  alass error: {(r.stderr or r.stdout)[-300:]}", 'error')
+    except subprocess.TimeoutExpired:
+        log_cb("  alass timed out (>10 min).", 'error')
+    except Exception as e:
+        log_cb(f"  alass failed: {e}", 'error')
+
+    return False
 
 
 # ─── OCR pipeline ─────────────────────────────────────────────────────────────
