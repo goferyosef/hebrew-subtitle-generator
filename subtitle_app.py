@@ -456,7 +456,7 @@ def _ollama_translate_batch(texts: list, model: str, system: str, context_window
 
 def _ollama_full_translate(raw_texts: list, model: str, log_cb,
                            cancel_check=None, gemini_key: str = None,
-                           progress_cb=None) -> list:
+                           progress_cb=None, failed_counter=None) -> list:
     clean_texts = [strip_sub_tags(t) for t in raw_texts]
     log_cb("  Detecting character genders…", 'dim')
     gender_block = detect_character_genders([t for t in clean_texts if t][:60], model, log_cb,
@@ -487,6 +487,8 @@ def _ollama_full_translate(raw_texts: list, model: str, log_cb,
             context_window = context_window[-OLLAMA_CONTEXT:]
         except Exception as e:
             batch_num = batch_start // OLLAMA_BATCH_SIZE + 1
+            if failed_counter is not None:
+                failed_counter[0] += 1
             if gemini_key:
                 log_cb(f"  Batch {batch_num} failed ({e}) — Gemini fallback", 'warning')
                 batch_texts = [raw_texts[batch_start + j] for j, _ in non_empty]
@@ -554,7 +556,8 @@ def _call_gemini(api_key: str, prompt: str) -> str:
 
 
 def _gemini_full_translate(raw_texts: list, api_key: str, log_cb,
-                           cancel_check=None, progress_cb=None) -> list:
+                           cancel_check=None, progress_cb=None,
+                           failed_counter=None) -> list:
     results     = list(raw_texts)
     clean_texts = [strip_sub_tags(t) for t in raw_texts]
     total       = len(raw_texts)
@@ -595,6 +598,8 @@ def _gemini_full_translate(raw_texts: list, api_key: str, log_cb,
                     results[pos] = RTL_MARK + out[key]
         except Exception as e:
             log_cb(f'  Gemini batch {start // GEMINI_BATCH_SIZE + 1} failed: {e}', 'error')
+            if failed_counter is not None:
+                failed_counter[0] += 1
 
         done = min(start + GEMINI_BATCH_SIZE, total)
         log_cb(f'  {done}/{total} lines translated', 'dim')
@@ -606,7 +611,8 @@ def _gemini_full_translate(raw_texts: list, api_key: str, log_cb,
 
 # ─── Google Translate (fallback) ──────────────────────────────────────────────
 
-def _google_batch_translate(texts: list, log_cb, cancel_check=None, progress_cb=None) -> list:
+def _google_batch_translate(texts: list, log_cb, cancel_check=None, progress_cb=None,
+                            failed_counter=None) -> list:
     from deep_translator import GoogleTranslator
     translator = GoogleTranslator(source='auto', target='iw')
     results    = list(texts)
@@ -630,6 +636,8 @@ def _google_batch_translate(texts: list, log_cb, cancel_check=None, progress_cb=
                 flush(b_texts, b_indices, attempt + 1)
                 return
             log_cb("  Batch failed — retrying line-by-line…", 'dim')
+            if failed_counter is not None:
+                failed_counter[0] += 1
         for txt, idx in zip(b_texts, b_indices):
             for retry in range(3):
                 try:
@@ -680,22 +688,32 @@ def translate_and_save(subs, out_path: str, log_cb,
         subs.save(out_path, encoding='utf-8-sig')
         return
 
-    raw_texts = [e.text for _, e in with_text]
-    log_cb(f"Translating {len(raw_texts)} lines…")
+    raw_texts      = [e.text for _, e in with_text]
+    failed_counter = [0]
+    start_time     = time.time()
 
     if ollama_model:
-        log_cb(f"  Ollama ({ollama_model}) — AI, gender-aware")
+        translator_name = f"Ollama ({ollama_model})"
+        log_cb(f"Translating {len(raw_texts)} lines…")
+        log_cb(f"  {translator_name} — AI, gender-aware")
         translated = _ollama_full_translate(raw_texts, ollama_model, log_cb, cancel_check,
-                                            gemini_key=gemini_key, progress_cb=progress_cb)
+                                            gemini_key=gemini_key, progress_cb=progress_cb,
+                                            failed_counter=failed_counter)
     elif gemini_key:
-        log_cb(f"  Gemini ({GEMINI_MODEL})")
+        translator_name = f"Gemini ({GEMINI_MODEL})"
+        log_cb(f"Translating {len(raw_texts)} lines…")
+        log_cb(f"  {translator_name}")
         translated = _gemini_full_translate(raw_texts, gemini_key, log_cb, cancel_check,
-                                            progress_cb=progress_cb)
+                                            progress_cb=progress_cb,
+                                            failed_counter=failed_counter)
     else:
-        log_cb("  Google Translate (free)")
+        translator_name = "Google Translate"
+        log_cb(f"Translating {len(raw_texts)} lines…")
+        log_cb(f"  {translator_name} (free)")
         try:
             translated = _google_batch_translate(raw_texts, log_cb, cancel_check,
-                                                 progress_cb=progress_cb)
+                                                 progress_cb=progress_cb,
+                                                 failed_counter=failed_counter)
         except ImportError:
             log_cb("deep-translator not installed — pip install deep-translator", 'error')
             return
@@ -709,7 +727,20 @@ def translate_and_save(subs, out_path: str, log_cb,
             text=t_map.get(i, event.text),
         ))
     result.save(out_path, encoding='utf-8-sig')
-    log_cb(f"Saved: {Path(out_path).name}", 'success')
+
+    elapsed  = time.time() - start_time
+    duration = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{int(elapsed)}s"
+
+    log_cb("─" * 50)
+    log_cb(f"  Translated {len(raw_texts)} lines → Hebrew")
+    log_cb(f"  Translator:  {translator_name}")
+    log_cb(f"  Duration:    {duration}")
+    if failed_counter[0]:
+        log_cb(f"  Failed batches: {failed_counter[0]} (recovered via fallback)", 'warning')
+    else:
+        log_cb(f"  Failed batches: none", 'success')
+    log_cb(f"  Output: {Path(out_path).name}", 'success')
+    log_cb("─" * 50)
 
 
 # ─── Main GUI Application ─────────────────────────────────────────────────────
