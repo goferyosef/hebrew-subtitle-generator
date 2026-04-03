@@ -375,35 +375,55 @@ def ollama_chat(model: str, system: str, user: str, timeout: int = OLLAMA_TIMEOU
         return json.loads(resp.read())["message"]["content"]
 
 
-def detect_character_genders(sample_texts: list, model: str, log_cb) -> str:
+def _parse_gender_response(response: str, log_cb) -> str:
+    """Parse a JSON gender-detection response and return the gender block string."""
+    m = re.search(r'\{[\s\S]*\}', response)
+    if not m:
+        return ""
+    data  = json.loads(m.group())
+    chars = [c for c in data.get('characters', [])
+             if c.get('name') and c.get('gender') != 'unknown']
+    if not chars:
+        return ""
+    summary   = ', '.join(f"{c['name']} ({c['gender']})" for c in chars)
+    log_cb(f"  Characters: {summary}", 'dim')
+    char_list = '\n'.join(f"  - {c['name']}: {c['gender']}" for c in chars)
+    return (
+        "CHARACTER GENDERS (use correct Hebrew gender forms when these characters "
+        "speak or are spoken to):\n" + char_list
+    )
+
+
+def detect_character_genders(sample_texts: list, model: str, log_cb,
+                              gemini_key: str = None) -> str:
     if not sample_texts:
         return ""
     numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(sample_texts[:60]))
-    user_msg = (
+    prompt = (
         "Read these subtitle lines and identify character names and their genders.\n"
         "Return ONLY JSON: {\"characters\": [{\"name\": \"...\", \"gender\": \"male|female|unknown\"}, ...]}\n"
         "If no character names are detectable, return {\"characters\": []}\n\n"
         f"Lines:\n{numbered}"
     )
+
+    # Try Gemini first (fast, reliable)
+    if gemini_key:
+        try:
+            response = _call_gemini(gemini_key, prompt)
+            result   = _parse_gender_response(response, log_cb)
+            if result:
+                return result
+        except Exception as e:
+            log_cb(f"  Gemini gender detection failed: {e} — trying Ollama", 'dim')
+
+    # Fall back to Ollama
     try:
         response = ollama_chat(
             model,
             "You are a script analyst. Identify character names and genders from dialogue. Return only valid JSON.",
-            user_msg, timeout=40,
+            prompt, timeout=40,
         )
-        m = re.search(r'\{[\s\S]*\}', response)
-        if m:
-            data  = json.loads(m.group())
-            chars = [c for c in data.get('characters', [])
-                     if c.get('name') and c.get('gender') != 'unknown']
-            if chars:
-                summary  = ', '.join(f"{c['name']} ({c['gender']})" for c in chars)
-                log_cb(f"  Characters: {summary}", 'dim')
-                char_list = '\n'.join(f"  - {c['name']}: {c['gender']}" for c in chars)
-                return (
-                    "CHARACTER GENDERS (use correct Hebrew gender forms when these characters "
-                    "speak or are spoken to):\n" + char_list
-                )
+        return _parse_gender_response(response, log_cb)
     except Exception as e:
         log_cb(f"  Gender detection skipped: {e}", 'dim')
     return ""
@@ -438,7 +458,8 @@ def _ollama_full_translate(raw_texts: list, model: str, log_cb,
                            cancel_check=None, gemini_key: str = None) -> list:
     clean_texts = [strip_sub_tags(t) for t in raw_texts]
     log_cb("  Detecting character genders…", 'dim')
-    gender_block = detect_character_genders([t for t in clean_texts if t][:60], model, log_cb)
+    gender_block = detect_character_genders([t for t in clean_texts if t][:60], model, log_cb,
+                                            gemini_key=gemini_key)
     system       = HEBREW_SYSTEM_PROMPT.format(gender_block=gender_block)
 
     results        = list(raw_texts)
