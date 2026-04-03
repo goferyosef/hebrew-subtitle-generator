@@ -108,6 +108,14 @@ OLLAMA_TIMEOUT    = 150
 # Hebrew RTL marker — prepended to each translated line so players display it correctly
 RTL_MARK = '\u200f'
 
+# Gemini
+GEMINI_API_KEY_FILE = Path(__file__).parent / '.gemini_key'
+GEMINI_MODEL        = 'gemini-2.5-flash'
+GEMINI_BATCH_SIZE   = 50
+GEMINI_RETRY_WAIT   = 15
+GEMINI_MAX_RETRIES  = 4
+GEMINI_BR           = '<<BR>>'
+
 PREFERRED_MODELS = [
     'qwen2.5:7b', 'qwen2.5:3b', 'qwen2.5:1.5b', 'qwen2.5:latest',
     'qwen2:7b',   'qwen2:latest',
@@ -476,6 +484,90 @@ def _ollama_full_translate(raw_texts: list, model: str, log_cb, cancel_check=Non
     return results
 
 
+# ─── Gemini AI Translation ────────────────────────────────────────────────────
+
+def _load_gemini_key() -> str:
+    if GEMINI_API_KEY_FILE.exists():
+        return GEMINI_API_KEY_FILE.read_text().strip()
+    return ''
+
+
+def _call_gemini(api_key: str, prompt: str) -> str:
+    url = (
+        'https://generativelanguage.googleapis.com/v1beta/models/'
+        f'{GEMINI_MODEL}:generateContent?key={api_key}'
+    )
+    payload = json.dumps({
+        'contents': [{'parts': [{'text': prompt}]}],
+        'generationConfig': {'maxOutputTokens': 8192},
+    }).encode('utf-8')
+    for attempt in range(GEMINI_MAX_RETRIES):
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={'Content-Type': 'application/json'},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read())
+            return data['candidates'][0]['content']['parts'][0]['text']
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                time.sleep(GEMINI_RETRY_WAIT * (attempt + 1))
+                continue
+            raise RuntimeError(
+                f'Gemini HTTP {e.code}: {e.read().decode("utf-8", errors="replace")}'
+            ) from e
+    raise RuntimeError('Gemini rate limit — try again in a minute.')
+
+
+def _gemini_full_translate(raw_texts: list, api_key: str, log_cb, cancel_check=None) -> list:
+    results     = list(raw_texts)
+    clean_texts = [strip_sub_tags(t) for t in raw_texts]
+    total       = len(raw_texts)
+
+    for start in range(0, total, GEMINI_BATCH_SIZE):
+        if cancel_check and cancel_check():
+            log_cb('  Cancelled.', 'warning')
+            return results
+
+        batch_clean   = clean_texts[start : start + GEMINI_BATCH_SIZE]
+        batch_indices = list(range(start, min(start + GEMINI_BATCH_SIZE, total)))
+        non_empty     = [(pos, t) for pos, t in zip(batch_indices, batch_clean) if t.strip()]
+        if not non_empty:
+            continue
+
+        flat     = [t.replace('\n', GEMINI_BR) for _, t in non_empty]
+        numbered = '\n'.join(f'[{i+1}] {t}' for i, t in enumerate(flat))
+        prompt   = (
+            'Translate the following subtitle lines to Hebrew.\n'
+            'Rules:\n'
+            '- Keep translations natural and suitable for TV subtitles.\n'
+            f'- The token {GEMINI_BR} marks a line break inside a subtitle — preserve it.\n'
+            '- Return ONLY the translations, each prefixed with [N] where N is the number.\n'
+            '- Every translation on exactly ONE line. No extra text.\n\n'
+            + numbered
+        )
+
+        try:
+            result = _call_gemini(api_key, prompt)
+            out    = {}
+            for line in result.split('\n'):
+                m = re.match(r'\[(\d+)\]\s*(.*)', line.strip())
+                if m:
+                    out[int(m.group(1))] = m.group(2).strip().replace(GEMINI_BR, '\n')
+            for local_idx, (pos, _) in enumerate(non_empty):
+                key = local_idx + 1
+                if key in out:
+                    results[pos] = RTL_MARK + out[key]
+        except Exception as e:
+            log_cb(f'  Gemini batch {start // GEMINI_BATCH_SIZE + 1} failed: {e}', 'error')
+
+        done = min(start + GEMINI_BATCH_SIZE, total)
+        log_cb(f'  {done}/{total} lines translated', 'dim')
+
+    return results
+
+
 # ─── Google Translate (fallback) ──────────────────────────────────────────────
 
 def _google_batch_translate(texts: list, log_cb, cancel_check=None) -> list:
@@ -537,7 +629,7 @@ def _google_batch_translate(texts: list, log_cb, cancel_check=None) -> list:
 # ─── Translation dispatcher ───────────────────────────────────────────────────
 
 def translate_and_save(subs, out_path: str, log_cb,
-                       ollama_model: str = None, cancel_check=None):
+                       ollama_model: str = None, gemini_key: str = None, cancel_check=None):
     import pysubs2
 
     with_text = [(i, e) for i, e in enumerate(subs.events) if strip_sub_tags(e.text)]
@@ -552,6 +644,9 @@ def translate_and_save(subs, out_path: str, log_cb,
     if ollama_model:
         log_cb(f"  Ollama ({ollama_model}) — AI, gender-aware")
         translated = _ollama_full_translate(raw_texts, ollama_model, log_cb, cancel_check)
+    elif gemini_key:
+        log_cb(f"  Gemini ({GEMINI_MODEL})")
+        translated = _gemini_full_translate(raw_texts, gemini_key, log_cb, cancel_check)
     else:
         log_cb("  Google Translate (free)")
         try:
@@ -583,6 +678,7 @@ class SubtitleApp(_TK_BASE):
         self.resizable(True, True)
         self.ollama_model     = None
         self.available_models = []
+        self.gemini_key       = _load_gemini_key()
         self._cancel_event    = threading.Event()
         self._build_widgets()
         self.after(200, self._check_dependencies)
@@ -739,6 +835,12 @@ class SubtitleApp(_TK_BASE):
                 level = 'warning' if pkg in ('ffsubsync', 'tkinterdnd2') else 'error'
                 self.log(f"  ✗ {pkg}  →  pip install {pkg}", level)
 
+        # Gemini
+        if self.gemini_key:
+            self.log(f"  Gemini API key found ({GEMINI_MODEL})", 'success')
+        else:
+            self.log("  No Gemini key — add one to .gemini_key file", 'dim')
+
         # Ollama
         self.log("Checking Ollama…", 'dim')
         available, models = check_ollama()
@@ -749,9 +851,8 @@ class SubtitleApp(_TK_BASE):
             self.log(f"  Ollama running — best model: {best}", 'success')
         else:
             self.ollama_model = None
-            self.log("  Ollama not running → using Google Translate", 'warning')
-            self.log("  Better Hebrew: install Ollama (https://ollama.com) then:", 'dim')
-            self.log("    ollama pull qwen2.5:7b", 'dim')
+            fallback = f"Gemini ({GEMINI_MODEL})" if self.gemini_key else "Google Translate"
+            self.log(f"  Ollama not running → using {fallback}", 'warning')
 
         self._update_translator_options()
         self.log("Ready.", 'success')
@@ -765,17 +866,24 @@ class SubtitleApp(_TK_BASE):
                 for m in self.available_models:
                     if m != best:
                         options.append(f"Ollama — {m}")
+            if self.gemini_key:
+                options.append(f"Gemini ({GEMINI_MODEL})")
             options.append("Google Translate (free)")
             self.trans_combo['values'] = options
             self.trans_combo.current(0)
         self.after(0, _do)
 
     def _get_ollama_model(self) -> str:
-        """Return model name if Ollama is selected, else empty string."""
         sel = self.translator_var.get()
         if sel.startswith("Ollama"):
             m = re.match(r'Ollama\s*—\s*(\S+)', sel)
             return m.group(1) if m else (self.ollama_model or '')
+        return ''
+
+    def _get_gemini_key(self) -> str:
+        sel = self.translator_var.get()
+        if 'Gemini' in sel:
+            return self.gemini_key
         return ''
 
     # ── File dispatch ──────────────────────────────────────────────────────────
@@ -860,6 +968,7 @@ class SubtitleApp(_TK_BASE):
             subs = pysubs2.load(sync_path)
             out  = str(p.parent / (p.stem + "_SYNC_HEB.srt"))
             translate_and_save(subs, out, self.log, self._get_ollama_model(),
+                               gemini_key=self._get_gemini_key(),
                                cancel_check=self._should_cancel)
             self.log(f"Done! → {Path(out).name}", 'success')
 
