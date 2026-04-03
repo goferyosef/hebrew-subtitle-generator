@@ -434,7 +434,8 @@ def _ollama_translate_batch(texts: list, model: str, system: str, context_window
     return _parse_ollama_json(ollama_chat(model, system, user_msg), len(texts))
 
 
-def _ollama_full_translate(raw_texts: list, model: str, log_cb, cancel_check=None) -> list:
+def _ollama_full_translate(raw_texts: list, model: str, log_cb,
+                           cancel_check=None, gemini_key: str = None) -> list:
     clean_texts = [strip_sub_tags(t) for t in raw_texts]
     log_cb("  Detecting character genders…", 'dim')
     gender_block = detect_character_genders([t for t in clean_texts if t][:60], model, log_cb)
@@ -463,19 +464,27 @@ def _ollama_full_translate(raw_texts: list, model: str, log_cb, cancel_check=Non
                 context_window.append(heb)
             context_window = context_window[-OLLAMA_CONTEXT:]
         except Exception as e:
-            log_cb(f"  Batch {batch_start // OLLAMA_BATCH_SIZE + 1} failed ({e}) — Google fallback", 'warning')
-            try:
-                from deep_translator import GoogleTranslator
-                gt = GoogleTranslator(source='auto', target='iw')
-                for j, text in enumerate(batch_clean):
-                    if text.strip():
-                        try:
-                            results[batch_start + j] = RTL_MARK + gt.translate(text)
-                            time.sleep(0.2)
-                        except Exception:
-                            pass
-            except ImportError:
-                pass
+            batch_num = batch_start // OLLAMA_BATCH_SIZE + 1
+            if gemini_key:
+                log_cb(f"  Batch {batch_num} failed ({e}) — Gemini fallback", 'warning')
+                batch_texts = [raw_texts[batch_start + j] for j, _ in non_empty]
+                fallback    = _gemini_full_translate(batch_texts, gemini_key, log_cb, cancel_check)
+                for (j, _), heb in zip(non_empty, fallback):
+                    results[batch_start + j] = heb
+            else:
+                log_cb(f"  Batch {batch_num} failed ({e}) — Google fallback", 'warning')
+                try:
+                    from deep_translator import GoogleTranslator
+                    gt = GoogleTranslator(source='auto', target='iw')
+                    for j, text in enumerate(batch_clean):
+                        if text.strip():
+                            try:
+                                results[batch_start + j] = RTL_MARK + gt.translate(text)
+                                time.sleep(0.2)
+                            except Exception:
+                                pass
+                except ImportError:
+                    pass
 
         done = min(batch_start + OLLAMA_BATCH_SIZE, total)
         if done % 60 == 0 or done == total:
@@ -643,7 +652,8 @@ def translate_and_save(subs, out_path: str, log_cb,
 
     if ollama_model:
         log_cb(f"  Ollama ({ollama_model}) — AI, gender-aware")
-        translated = _ollama_full_translate(raw_texts, ollama_model, log_cb, cancel_check)
+        translated = _ollama_full_translate(raw_texts, ollama_model, log_cb, cancel_check,
+                                            gemini_key=gemini_key)
     elif gemini_key:
         log_cb(f"  Gemini ({GEMINI_MODEL})")
         translated = _gemini_full_translate(raw_texts, gemini_key, log_cb, cancel_check)
