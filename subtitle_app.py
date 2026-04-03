@@ -103,7 +103,7 @@ GOOGLE_RATE_DELAY = 0.4
 OLLAMA_URL        = "http://localhost:11434"
 OLLAMA_BATCH_SIZE = 15
 OLLAMA_CONTEXT    = 6
-OLLAMA_TIMEOUT    = 150
+OLLAMA_TIMEOUT    = 45
 
 # Hebrew RTL marker — prepended to each translated line so players display it correctly
 RTL_MARK = '\u200f'
@@ -891,10 +891,9 @@ class SubtitleApp(_TK_BASE):
         return ''
 
     def _get_gemini_key(self) -> str:
-        sel = self.translator_var.get()
-        if 'Gemini' in sel:
-            return self.gemini_key
-        return ''
+        # Always return the key — used as primary when Gemini is selected,
+        # and as fallback when Ollama is selected but fails.
+        return self.gemini_key
 
     # ── File dispatch ──────────────────────────────────────────────────────────
 
