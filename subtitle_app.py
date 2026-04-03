@@ -553,7 +553,8 @@ def _call_gemini(api_key: str, prompt: str) -> str:
     raise RuntimeError('Gemini rate limit — try again in a minute.')
 
 
-def _gemini_full_translate(raw_texts: list, api_key: str, log_cb, cancel_check=None) -> list:
+def _gemini_full_translate(raw_texts: list, api_key: str, log_cb,
+                           cancel_check=None, progress_cb=None) -> list:
     results     = list(raw_texts)
     clean_texts = [strip_sub_tags(t) for t in raw_texts]
     total       = len(raw_texts)
@@ -597,6 +598,8 @@ def _gemini_full_translate(raw_texts: list, api_key: str, log_cb, cancel_check=N
 
         done = min(start + GEMINI_BATCH_SIZE, total)
         log_cb(f'  {done}/{total} lines translated', 'dim')
+        if progress_cb:
+            progress_cb(done, total)
 
     return results
 
