@@ -891,14 +891,15 @@ class SubtitleApp(_TK_BASE):
     def _update_translator_options(self):
         def _do():
             options = []
+            # Gemini first — fast and reliable
+            if self.gemini_key:
+                options.append(f"Gemini ({GEMINI_MODEL})")
             if self.available_models:
                 best = self.ollama_model or ''
                 options.append(f"Ollama — {best} (AI, gender-aware)")
                 for m in self.available_models:
                     if m != best:
                         options.append(f"Ollama — {m}")
-            if self.gemini_key:
-                options.append(f"Gemini ({GEMINI_MODEL})")
             options.append("Google Translate (free)")
             self.trans_combo['values'] = options
             self.trans_combo.current(0)
