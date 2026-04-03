@@ -455,7 +455,8 @@ def _ollama_translate_batch(texts: list, model: str, system: str, context_window
 
 
 def _ollama_full_translate(raw_texts: list, model: str, log_cb,
-                           cancel_check=None, gemini_key: str = None) -> list:
+                           cancel_check=None, gemini_key: str = None,
+                           progress_cb=None) -> list:
     clean_texts = [strip_sub_tags(t) for t in raw_texts]
     log_cb("  Detecting character genders…", 'dim')
     gender_block = detect_character_genders([t for t in clean_texts if t][:60], model, log_cb,
@@ -510,6 +511,8 @@ def _ollama_full_translate(raw_texts: list, model: str, log_cb,
         done = min(batch_start + OLLAMA_BATCH_SIZE, total)
         if done % 60 == 0 or done == total:
             log_cb(f"  {done}/{total} lines translated", 'dim')
+        if progress_cb:
+            progress_cb(done, total)
 
     return results
 
@@ -600,10 +603,11 @@ def _gemini_full_translate(raw_texts: list, api_key: str, log_cb, cancel_check=N
 
 # ─── Google Translate (fallback) ──────────────────────────────────────────────
 
-def _google_batch_translate(texts: list, log_cb, cancel_check=None) -> list:
+def _google_batch_translate(texts: list, log_cb, cancel_check=None, progress_cb=None) -> list:
     from deep_translator import GoogleTranslator
     translator = GoogleTranslator(source='auto', target='iw')
     results    = list(texts)
+    total      = len(texts)
     batch_t, batch_i, batch_chars = [], [], 0
 
     def flush(b_texts, b_indices, attempt=0):
@@ -646,20 +650,25 @@ def _google_batch_translate(texts: list, log_cb, cancel_check=None) -> list:
             time.sleep(GOOGLE_RATE_DELAY)
             batch_t, batch_i, batch_chars = [], [], 0
             if i % 100 == 0:
-                log_cb(f"  {i}/{len(texts)} lines translated", 'dim')
+                log_cb(f"  {i}/{total} lines translated", 'dim')
+            if progress_cb:
+                progress_cb(i, total)
         batch_t.append(clean)
         batch_i.append(i)
         batch_chars += len(clean) + len(GOOGLE_BATCH_SEP)
 
     if batch_t:
         flush(batch_t, batch_i)
+    if progress_cb:
+        progress_cb(total, total)
     return results
 
 
 # ─── Translation dispatcher ───────────────────────────────────────────────────
 
 def translate_and_save(subs, out_path: str, log_cb,
-                       ollama_model: str = None, gemini_key: str = None, cancel_check=None):
+                       ollama_model: str = None, gemini_key: str = None,
+                       cancel_check=None, progress_cb=None):
     import pysubs2
 
     with_text = [(i, e) for i, e in enumerate(subs.events) if strip_sub_tags(e.text)]
@@ -674,14 +683,16 @@ def translate_and_save(subs, out_path: str, log_cb,
     if ollama_model:
         log_cb(f"  Ollama ({ollama_model}) — AI, gender-aware")
         translated = _ollama_full_translate(raw_texts, ollama_model, log_cb, cancel_check,
-                                            gemini_key=gemini_key)
+                                            gemini_key=gemini_key, progress_cb=progress_cb)
     elif gemini_key:
         log_cb(f"  Gemini ({GEMINI_MODEL})")
-        translated = _gemini_full_translate(raw_texts, gemini_key, log_cb, cancel_check)
+        translated = _gemini_full_translate(raw_texts, gemini_key, log_cb, cancel_check,
+                                            progress_cb=progress_cb)
     else:
         log_cb("  Google Translate (free)")
         try:
-            translated = _google_batch_translate(raw_texts, log_cb, cancel_check)
+            translated = _google_batch_translate(raw_texts, log_cb, cancel_check,
+                                                 progress_cb=progress_cb)
         except ImportError:
             log_cb("deep-translator not installed — pip install deep-translator", 'error')
             return
@@ -831,10 +842,19 @@ class SubtitleApp(_TK_BASE):
         def _do():
             self.status_var.set(text)
             if running:
+                self.progress.configure(mode='indeterminate')
                 self.progress.start(12)
             else:
                 self.progress.stop()
+                self.progress.configure(mode='indeterminate')
                 self.progress['value'] = 0
+        self.after(0, _do)
+
+    def _set_progress(self, done: int, total: int):
+        def _do():
+            self.progress.stop()
+            self.progress.configure(mode='determinate', maximum=total, value=done)
+            self.status_var.set(f"Translating… {done}/{total} lines ({int(done/total*100)}%)")
         self.after(0, _do)
 
     # ── Dependency & Ollama detection ─────────────────────────────────────────
@@ -1058,7 +1078,9 @@ class SubtitleApp(_TK_BASE):
             return
         out = str(p.parent / (p.stem + "_HEB.srt"))
         translate_and_save(subs, out, self.log, self._get_ollama_model(),
-                           cancel_check=self._should_cancel)
+                           gemini_key=self._get_gemini_key(),
+                           cancel_check=self._should_cancel,
+                           progress_cb=self._set_progress)
         if not self._should_cancel():
             self.log(f"Done! → {out}", 'success')
 
@@ -1104,9 +1126,12 @@ class SubtitleApp(_TK_BASE):
         self.log(f"Loaded {len(subs.events)} entries")
         out = str(p.parent / (p.stem + "_HEB.srt"))
         translate_and_save(subs, out, self.log, self._get_ollama_model(),
-                           cancel_check=self._should_cancel)
+                           gemini_key=self._get_gemini_key(),
+                           cancel_check=self._should_cancel,
+                           progress_cb=self._set_progress)
         if not self._should_cancel():
-            self.log(f"Done! → {out}", 'success')
+            Path(srt_path).unlink(missing_ok=True)
+            self.log(f"Done! → {Path(out).name}", 'success')
 
     # ── Pipeline 3: hard-coded OCR ────────────────────────────────────────────
 
@@ -1171,9 +1196,12 @@ class SubtitleApp(_TK_BASE):
 
         out = str(p.parent / (p.stem + "_HEB.srt"))
         translate_and_save(subs, out, self.log, self._get_ollama_model(),
-                           cancel_check=self._should_cancel)
+                           gemini_key=self._get_gemini_key(),
+                           cancel_check=self._should_cancel,
+                           progress_cb=self._set_progress)
         if not self._should_cancel():
-            self.log(f"Done! → {out}", 'success')
+            Path(srt_path).unlink(missing_ok=True)
+            self.log(f"Done! → {Path(out).name}", 'success')
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
