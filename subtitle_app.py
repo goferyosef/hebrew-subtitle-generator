@@ -15,6 +15,7 @@ Translation backends (auto-selected):
 """
 
 import difflib
+import hashlib
 import importlib
 import json
 import os
@@ -232,34 +233,77 @@ class OcrLine:
     last_ms: int
 
 
+def _tess_lang() -> str:
+    """Return best available Tesseract language combo (prefers common subtitle languages)."""
+    try:
+        import pytesseract
+        available = set(pytesseract.get_languages(config=''))
+        wanted = ['eng', 'heb', 'ara', 'rus', 'spa', 'fra', 'deu', 'ita', 'por',
+                  'chi_sim', 'jpn', 'kor']
+        langs = [l for l in wanted if l in available]
+        return '+'.join(langs) if langs else 'eng'
+    except Exception:
+        return 'eng'
+
+
 def preprocess_for_ocr(region):
+    """Takes an already-upscaled BGR region; returns list of threshold variants."""
     import cv2
     import numpy as np
-    gray   = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-    scaled = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    _, t1  = cv2.threshold(scaled, 190, 255, cv2.THRESH_BINARY)
-    _, t2  = cv2.threshold(scaled, 100, 255, cv2.THRESH_BINARY_INV)
-    t3     = cv2.adaptiveThreshold(scaled, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                    cv2.THRESH_BINARY, 15, 3)
-    hsv    = cv2.cvtColor(cv2.resize(region, None, fx=2, fy=2), cv2.COLOR_BGR2HSV)
-    yellow = cv2.inRange(hsv, np.array([15, 80, 80]), np.array([40, 255, 255]))
+    gray     = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    denoised = cv2.fastNlMeansDenoising(gray, h=10)
+    kernel   = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+    sharp    = cv2.filter2D(denoised, -1, kernel)
+    _, t1    = cv2.threshold(sharp, 190, 255, cv2.THRESH_BINARY)
+    _, t2    = cv2.threshold(sharp, 100, 255, cv2.THRESH_BINARY_INV)
+    t3       = cv2.adaptiveThreshold(sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                      cv2.THRESH_BINARY, 15, 3)
+    hsv      = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+    yellow   = cv2.inRange(hsv, np.array([15, 80, 80]), np.array([40, 255, 255]))
     return [t1, t2, t3, yellow]
 
 
-def ocr_frame(frame) -> str:
-    import pytesseract
+def _subtitle_region(frame):
+    """Crop bottom 20% (subtitle zone), resize to max 960px wide, upscale 2x."""
+    import cv2
     h, w   = frame.shape[:2]
-    region = frame[int(h * 0.78):int(h * 0.97), int(w * 0.03):int(w * 0.97)]
+    region = frame[int(h * 0.80):, :]
     if region.size == 0:
+        return None
+    rh, rw = region.shape[:2]
+    if rw > 960:
+        scale  = 960 / rw
+        region = cv2.resize(region, (960, max(1, int(rh * scale))),
+                             interpolation=cv2.INTER_AREA)
+    return cv2.resize(region, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+
+
+def _region_thumb_hash(frame) -> str | None:
+    """64×16 thumbnail hash of subtitle zone — fast change detector."""
+    import cv2
+    h, w   = frame.shape[:2]
+    region = frame[int(h * 0.80):, :]
+    if region.size == 0:
+        return None
+    small = cv2.resize(cv2.cvtColor(region, cv2.COLOR_BGR2GRAY), (64, 16),
+                        interpolation=cv2.INTER_AREA)
+    return hashlib.md5(small.tobytes()).hexdigest()
+
+
+def ocr_frame(frame, tess_lang: str = 'eng') -> str:
+    import pytesseract
+    region = _subtitle_region(frame)
+    if region is None:
         return ''
     best, cfg = '', r'--oem 1 --psm 6 -c tessedit_char_blacklist=|~^_'
     for img in preprocess_for_ocr(region):
         try:
-            raw     = pytesseract.image_to_string(img, config=cfg, lang='eng')
+            raw     = pytesseract.image_to_string(img, config=cfg, lang=tess_lang)
             cleaned = ' '.join(raw.split())
             if len(cleaned) < 3:
                 continue
-            sym = sum(1 for c in cleaned if not (c.isalpha() or c in " ,.!?'-")) / max(len(cleaned), 1)
+            sym = sum(1 for c in cleaned
+                      if not (c.isalpha() or c in " ,.!?'-–—")) / max(len(cleaned), 1)
             if sym > 0.4:
                 continue
             if len(cleaned) > len(best):
@@ -1022,41 +1066,68 @@ class SubtitleApp(_TK_BASE):
         total_f     = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         duration_ms = int((total_f / fps) * 1000)
         dur_str     = f"{duration_ms // 60000}m {(duration_ms % 60000) // 1000}s"
-        self.log(f"Video: {dur_str}  ({total_f:,} frames @ {fps:.1f} fps)")
-        self.log("Scanning at 1 fps — may take several minutes…", 'warning')
 
-        raw_ocr, ms, report_at = [], 0, 60_000
+        tess_lang = _tess_lang()
+        self.log(f"Video: {dur_str}  ({total_f:,} frames @ {fps:.1f} fps)")
+        self.log(f"OCR language(s): {tess_lang}", 'dim')
+        self.log("Scanning at ~3 fps with change detection — faster than before…", 'warning')
+
+        step_ms    = 333          # ~3 fps
+        raw_ocr    = []
+        ms         = 0
+        report_at  = 30_000      # progress report every 30 s
+        prev_hash  = None
+        ocr_calls  = 0
+        skipped    = 0
+
         while ms < duration_ms:
             if self._should_cancel():
                 cap.release()
                 self.log("OCR cancelled.", 'warning')
                 return
+
             cap.set(cv2.CAP_PROP_POS_MSEC, ms)
             ret, frame = cap.read()
             if not ret:
                 break
-            text = ocr_frame(frame)
+
+            # Skip OCR when subtitle zone hasn't changed (saves most of the time)
+            curr_hash = _region_thumb_hash(frame)
+            if curr_hash is not None and curr_hash == prev_hash:
+                skipped += 1
+                ms += step_ms
+                continue
+            prev_hash = curr_hash
+
+            text = ocr_frame(frame, tess_lang)
+            ocr_calls += 1
             if text:
                 raw_ocr.append((ms, text))
+
             if ms >= report_at:
-                self.log(f"  OCR: {ms / duration_ms * 100:.0f}%  ({ms // 60000}m scanned)", 'dim')
-                report_at += 60_000
-            ms += 1000
+                pct = ms / duration_ms * 100
+                self.log(f"  OCR: {pct:.0f}%  ({ms // 60000}m)  "
+                         f"OCR calls: {ocr_calls}  skipped: {skipped}", 'dim')
+                report_at += 30_000
+
+            ms += step_ms
 
         cap.release()
-        self.log(f"Scan complete — {len(raw_ocr)} frames with text")
+        self.log(f"Scan complete — {ocr_calls} OCR calls, {skipped} frames skipped, "
+                 f"{len(raw_ocr)} with text")
 
         if not raw_ocr:
             self.log("No subtitle text detected via OCR.", 'warning')
             return
 
         lines = deduplicate_ocr_lines(raw_ocr)
-        self.log(f"Deduplicated to {len(lines)} entries")
+        self.log(f"Deduplicated to {len(lines)} subtitle entries")
 
+        # Save raw OCR SRT (original language) before translation
         subs     = build_srt_from_ocr(lines)
-        srt_path = str(p.parent / (p.stem + ".srt"))
-        subs.save(srt_path, encoding='utf-8')
-        self.log(f"Saved OCR subtitles → {p.stem}.srt", 'success')
+        raw_path = str(p.parent / (p.stem + "_RAW.srt"))
+        subs.save(raw_path, encoding='utf-8')
+        self.log(f"Saved raw OCR subtitles → {p.stem}_RAW.srt", 'success')
 
         if self._should_cancel():
             return
