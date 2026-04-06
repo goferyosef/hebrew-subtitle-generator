@@ -111,22 +111,28 @@ GOOGLE_RATE_DELAY = 0.4
 # Shared config path for all AI keys
 AI_CONFIG_PATH = Path.home() / ".hebrew_subtitle_config.json"
 
+# Cerebras (fastest inference — https://cloud.cerebras.ai)
+CEREBRAS_API_URL   = "https://api.cerebras.ai/v1/chat/completions"
+CEREBRAS_MODEL     = "llama-3.3-70b"
+CEREBRAS_BATCH_SIZE  = 15
+CEREBRAS_BATCH_DELAY = 0.5   # wafer-scale chips — very fast, minimal delay needed
+CEREBRAS_TIMEOUT     = 60
+
+# Gemini Flash (free — https://aistudio.google.com, 15 RPM, 1M tokens/day)
+GEMINI_API_BASE    = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_MODEL       = "gemini-2.0-flash"
+GEMINI_BATCH_SIZE  = 20
+GEMINI_BATCH_DELAY = 1.0
+GEMINI_TIMEOUT     = 60
+
 # Groq (free cloud AI — https://console.groq.com)
 GROQ_API_URL     = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL       = "llama-3.3-70b-versatile"
 GROQ_BATCH_SIZE  = 10
 GROQ_BATCH_DELAY = 2.0
-GROQ_CONTEXT     = 20
 GROQ_TIMEOUT     = 60
 
-# Gemini Flash (free — https://aistudio.google.com)
-# Uses OpenAI-compatible endpoint; free tier: 15 RPM, 1M tokens/day
-GEMINI_API_URL     = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-GEMINI_MODEL       = "gemini-2.0-flash"
-GEMINI_BATCH_SIZE  = 20    # larger batches are fine — generous rate limits
-GEMINI_BATCH_DELAY = 1.0
-GEMINI_CONTEXT     = 20
-GEMINI_TIMEOUT     = 60
+AI_CONTEXT = 20   # lines of prior context kept for gender consistency
 
 # Hebrew RTL marker — prepended to each translated line so players display it correctly
 RTL_MARK = '\u200f'
@@ -407,12 +413,12 @@ def _save_config(data: dict):
     except Exception:
         pass
 
-def load_groq_key() -> str:
-    return _load_config().get('groq_api_key', '')
+def load_cerebras_key() -> str:
+    return _load_config().get('cerebras_api_key', '')
 
-def save_groq_key(key: str):
+def save_cerebras_key(key: str):
     data = _load_config()
-    data['groq_api_key'] = key.strip()
+    data['cerebras_api_key'] = key.strip()
     _save_config(data)
 
 def load_gemini_key() -> str:
@@ -421,6 +427,14 @@ def load_gemini_key() -> str:
 def save_gemini_key(key: str):
     data = _load_config()
     data['gemini_api_key'] = key.strip()
+    _save_config(data)
+
+def load_groq_key() -> str:
+    return _load_config().get('groq_api_key', '')
+
+def save_groq_key(key: str):
+    data = _load_config()
+    data['groq_api_key'] = key.strip()
     _save_config(data)
 
 def _ai_check(api_url: str, model: str, key: str) -> tuple:
@@ -476,17 +490,57 @@ def _ai_chat(api_url: str, model: str, key: str,
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())["choices"][0]["message"]["content"]
 
+def check_cerebras(key: str) -> tuple:
+    return _ai_check(CEREBRAS_API_URL, CEREBRAS_MODEL, key)
+
+def cerebras_chat(system: str, user: str, key: str, timeout: int = CEREBRAS_TIMEOUT) -> str:
+    return _ai_chat(CEREBRAS_API_URL, CEREBRAS_MODEL, key, system, user, timeout)
+
 def check_groq(key: str) -> tuple:
     return _ai_check(GROQ_API_URL, GROQ_MODEL, key)
-
-def check_gemini(key: str) -> tuple:
-    return _ai_check(GEMINI_API_URL, GEMINI_MODEL, key)
 
 def groq_chat(system: str, user: str, key: str, timeout: int = GROQ_TIMEOUT) -> str:
     return _ai_chat(GROQ_API_URL, GROQ_MODEL, key, system, user, timeout)
 
+def check_gemini(key: str) -> tuple:
+    """Ping Gemini native API. Returns (ok, error_msg)."""
+    if not key:
+        return False, "No key provided."
+    try:
+        url     = f"{GEMINI_API_BASE}/{GEMINI_MODEL}:generateContent?key={key}"
+        payload = json.dumps({"contents": [{"parts": [{"text": "hi"}]}],
+                              "generationConfig": {"maxOutputTokens": 5}}).encode()
+        req = urllib.request.Request(url, data=payload,
+                                     headers={"Content-Type": "application/json"},
+                                     method="POST")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status == 200, ""
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode(errors='replace')[:300]
+        except Exception:
+            pass
+        return False, f"HTTP {e.code} {e.reason}: {body}"
+    except urllib.error.URLError as e:
+        return False, f"Network error: {e.reason}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
 def gemini_chat(system: str, user: str, key: str, timeout: int = GEMINI_TIMEOUT) -> str:
-    return _ai_chat(GEMINI_API_URL, GEMINI_MODEL, key, system, user, timeout)
+    """Call Gemini native generateContent API."""
+    url     = f"{GEMINI_API_BASE}/{GEMINI_MODEL}:generateContent?key={key}"
+    payload = json.dumps({
+        "systemInstruction": {"parts": [{"text": system}]},
+        "contents":          [{"role": "user", "parts": [{"text": user}]}],
+        "generationConfig":  {"temperature": 0.3, "maxOutputTokens": 4096},
+    }).encode()
+    req = urllib.request.Request(url, data=payload,
+                                 headers={"Content-Type": "application/json"},
+                                 method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read())
+        return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
 def detect_character_genders(sample_texts: list, chat_fn, log_cb) -> str:
@@ -550,98 +604,122 @@ def _ai_translate_batch(texts: list, chat_fn, system: str, context_window: list)
     return _parse_llm_json(chat_fn(system, user_msg), len(texts))
 
 
-def _ai_full_translate(raw_texts: list, chat_fn, label: str, batch_size: int,
-                       batch_delay: float, context_size: int,
-                       log_cb, cancel_check=None, progress_cb=None) -> list:
-    clean_texts = [strip_sub_tags(t) for t in raw_texts]
-    log_cb("  Detecting character genders…", 'dim')
-    gender_block = detect_character_genders([t for t in clean_texts if t], chat_fn, log_cb)
-    system       = HEBREW_SYSTEM_PROMPT.format(gender_block=gender_block)
-
-    results        = list(raw_texts)
-    context_window = []
-    total          = len(raw_texts)
-
-    for batch_start in range(0, total, batch_size):
-        if cancel_check and cancel_check():
-            log_cb("  Cancelled.", 'warning')
-            return results
-
-        batch_raw   = raw_texts[batch_start : batch_start + batch_size]
-        batch_clean = clean_texts[batch_start : batch_start + batch_size]
-        non_empty   = [(j, t) for j, t in enumerate(batch_clean) if t.strip()]
-
-        if not non_empty:
-            continue
-
-        batch_num = batch_start // batch_size + 1
-        for attempt in range(4):
-            try:
-                translated = _ai_translate_batch([t for _, t in non_empty], chat_fn, system, context_window)
-                for (j, _), heb in zip(non_empty, translated):
-                    results[batch_start + j] = RTL_MARK + heb
-                    context_window.append(heb)
-                context_window = context_window[-context_size:]
-                break
-            except (urllib.error.HTTPError, ValueError) as e:
-                is_rate_limit = isinstance(e, urllib.error.HTTPError) and e.code == 429
-                if (is_rate_limit or isinstance(e, ValueError)) and attempt < 3:
-                    wait = 15 * (attempt + 1) if is_rate_limit else 3 * (attempt + 1)
-                    reason = "Rate limited" if is_rate_limit else "Parse error"
-                    log_cb(f"  {reason} on batch {batch_num}, retry {attempt + 1}/3 in {wait}s…", 'dim')
-                    time.sleep(wait)
-                else:
-                    log_cb(f"  Batch {batch_num} failed ({e}) — Google fallback", 'warning')
-                    _google_translate_lines(batch_clean, batch_start, results, log_cb)
-                    break
-            except Exception as e:
-                log_cb(f"  Batch {batch_num} failed ({e}) — Google fallback", 'warning')
-                _google_translate_lines(batch_clean, batch_start, results, log_cb)
-                break
-
-        time.sleep(batch_delay)
-        done = min(batch_start + batch_size, total)
-        if progress_cb:
-            progress_cb(done, total)
-        if done % 50 == 0 or done == total:
-            log_cb(f"  {done}/{total} lines translated", 'dim')
-
-    return results
+def _is_quota_exhausted(e: urllib.error.HTTPError) -> bool:
+    """True if 429 means daily/monthly quota gone (not just per-minute rate limit)."""
+    body = ""
+    try: body = e.read().decode(errors='replace')
+    except Exception: pass
+    return 'quota' in body.lower() or 'billing' in body.lower() or 'exceeded' in body.lower()
 
 
-def _google_translate_lines(batch_clean, batch_start, results, log_cb):
-    try:
-        from deep_translator import GoogleTranslator
-        gt = GoogleTranslator(source='auto', target='iw')
-        for j, text in enumerate(batch_clean):
-            if text.strip():
+def _ai_chain_translate(raw_texts: list, providers: list,
+                        log_cb, cancel_check=None, progress_cb=None) -> list:
+    """
+    Translate using a chain of AI providers.
+    providers: [{'label', 'chat_fn', 'batch_size', 'batch_delay'}, ...]
+    Each provider picks up untranslated lines where the previous left off.
+    Falls back to Google Translate if all AI providers are exhausted.
+    """
+    clean_texts     = [strip_sub_tags(t) for t in raw_texts]
+    results         = list(raw_texts)
+    translated_mask = [False] * len(raw_texts)
+    total           = len(raw_texts)
+
+    for pi, prov in enumerate(providers):
+        chat_fn     = prov['chat_fn']
+        label       = prov['label']
+        batch_size  = prov['batch_size']
+        batch_delay = prov['batch_delay']
+
+        # Only work on lines not yet translated
+        pending = [i for i, done in enumerate(translated_mask)
+                   if not done and clean_texts[i].strip()]
+        if not pending:
+            break
+
+        next_label = providers[pi + 1]['label'] if pi + 1 < len(providers) else "Google Translate"
+
+        log_cb(f"  [{label}] Detecting character genders…", 'dim')
+        gender_block   = detect_character_genders([clean_texts[i] for i in pending], chat_fn, log_cb)
+        system         = HEBREW_SYSTEM_PROMPT.format(gender_block=gender_block)
+        context_window = []
+        quota_hit      = False
+
+        for b_start in range(0, len(pending), batch_size):
+            if cancel_check and cancel_check():
+                log_cb("  Cancelled.", 'warning')
+                return results
+
+            batch_idx   = pending[b_start : b_start + batch_size]
+            batch_texts = [clean_texts[i] for i in batch_idx]
+            batch_num   = b_start // batch_size + 1
+
+            for attempt in range(4):
                 try:
-                    results[batch_start + j] = RTL_MARK + gt.translate(text)
+                    translated = _ai_translate_batch(batch_texts, chat_fn, system, context_window)
+                    for i, heb in zip(batch_idx, translated):
+                        results[i]         = RTL_MARK + heb
+                        translated_mask[i] = True
+                        context_window.append(heb)
+                    context_window = context_window[-AI_CONTEXT:]
+                    break
+                except urllib.error.HTTPError as e:
+                    if e.code == 429 and _is_quota_exhausted(e):
+                        log_cb(f"  [{label}] quota exhausted → {next_label}", 'warning')
+                        quota_hit = True
+                        break
+                    elif e.code == 429 and attempt < 3:
+                        wait = 15 * (attempt + 1)
+                        log_cb(f"  [{label}] rate limited, retry {attempt+1}/3 in {wait}s…", 'dim')
+                        time.sleep(wait)
+                    else:
+                        log_cb(f"  [{label}] batch {batch_num} failed ({e})", 'warning')
+                        break
+                except ValueError:
+                    if attempt < 3:
+                        time.sleep(3 * (attempt + 1))
+                    else:
+                        log_cb(f"  [{label}] parse error on batch {batch_num}, skipping", 'warning')
+                        break
+                except Exception as e:
+                    log_cb(f"  [{label}] batch {batch_num} failed ({e})", 'warning')
+                    break
+
+            if quota_hit:
+                break
+
+            time.sleep(batch_delay)
+            done = sum(translated_mask)
+            if progress_cb:
+                progress_cb(done, total)
+            if done % 50 == 0:
+                log_cb(f"  {done}/{total} lines translated", 'dim')
+
+        if not quota_hit:
+            break   # This provider finished everything
+
+    # Any lines still untranslated → Google Translate
+    remaining = [i for i, done in enumerate(translated_mask)
+                 if not done and clean_texts[i].strip()]
+    if remaining:
+        log_cb(f"  [Google Translate] {len(remaining)} lines remaining…", 'dim')
+        try:
+            from deep_translator import GoogleTranslator
+            gt = GoogleTranslator(source='auto', target='iw')
+            for i in remaining:
+                try:
+                    results[i] = RTL_MARK + gt.translate(clean_texts[i])
                     time.sleep(0.2)
                 except Exception:
                     pass
-    except ImportError:
-        pass
+        except ImportError:
+            pass
 
-
-def _groq_full_translate(raw_texts, key, log_cb, cancel_check=None, progress_cb=None):
-    return _ai_full_translate(
-        raw_texts,
-        chat_fn=lambda sys, usr: groq_chat(sys, usr, key),
-        label="Groq", batch_size=GROQ_BATCH_SIZE, batch_delay=GROQ_BATCH_DELAY,
-        context_size=GROQ_CONTEXT, log_cb=log_cb,
-        cancel_check=cancel_check, progress_cb=progress_cb,
-    )
-
-
-def _gemini_full_translate(raw_texts, key, log_cb, cancel_check=None, progress_cb=None):
-    return _ai_full_translate(
-        raw_texts,
-        chat_fn=lambda sys, usr: gemini_chat(sys, usr, key),
-        label="Gemini", batch_size=GEMINI_BATCH_SIZE, batch_delay=GEMINI_BATCH_DELAY,
-        context_size=GEMINI_CONTEXT, log_cb=log_cb,
-        cancel_check=cancel_check, progress_cb=progress_cb,
-    )
+    done = sum(translated_mask) + len([i for i in remaining if results[i] != raw_texts[i]])
+    log_cb(f"  {total}/{total} lines translated", 'dim')
+    if progress_cb:
+        progress_cb(total, total)
+    return results
 
 
 # ─── Google Translate (fallback) ──────────────────────────────────────────────
@@ -707,7 +785,8 @@ def _google_batch_translate(texts: list, log_cb, cancel_check=None, progress_cb=
 # ─── Translation dispatcher ───────────────────────────────────────────────────
 
 def translate_and_save(subs, out_path: str, log_cb,
-                       groq_key: str = None, gemini_key: str = None,
+                       cerebras_key: str = None, gemini_key: str = None,
+                       groq_key: str = None,
                        cancel_check=None, progress_cb=None):
     import pysubs2
 
@@ -722,12 +801,33 @@ def translate_and_save(subs, out_path: str, log_cb,
     if progress_cb:
         progress_cb(0, len(raw_texts))
 
+    # Build provider chain — whichever keys are set, in priority order
+    providers = []
+    if cerebras_key:
+        providers.append({
+            'label':       'Cerebras',
+            'chat_fn':     lambda sys, usr: cerebras_chat(sys, usr, cerebras_key),
+            'batch_size':  CEREBRAS_BATCH_SIZE,
+            'batch_delay': CEREBRAS_BATCH_DELAY,
+        })
     if gemini_key:
-        log_cb(f"  Gemini ({GEMINI_MODEL}) — AI, gender-aware")
-        translated = _gemini_full_translate(raw_texts, gemini_key, log_cb, cancel_check, progress_cb)
-    elif groq_key:
-        log_cb(f"  Groq ({GROQ_MODEL}) — AI, gender-aware")
-        translated = _groq_full_translate(raw_texts, groq_key, log_cb, cancel_check, progress_cb)
+        providers.append({
+            'label':       'Gemini',
+            'chat_fn':     lambda sys, usr: gemini_chat(sys, usr, gemini_key),
+            'batch_size':  GEMINI_BATCH_SIZE,
+            'batch_delay': GEMINI_BATCH_DELAY,
+        })
+    if groq_key:
+        providers.append({
+            'label':       'Groq',
+            'chat_fn':     lambda sys, usr: groq_chat(sys, usr, groq_key),
+            'batch_size':  GROQ_BATCH_SIZE,
+            'batch_delay': GROQ_BATCH_DELAY,
+        })
+
+    if providers:
+        log_cb(f"  AI chain: {' → '.join(p['label'] for p in providers)} → Google Translate")
+        translated = _ai_chain_translate(raw_texts, providers, log_cb, cancel_check, progress_cb)
     else:
         log_cb("  Google Translate (free)")
         try:
@@ -757,8 +857,9 @@ class SubtitleApp(_TK_BASE):
         self.title("Hebrew Subtitle Generator")
         self.geometry("780x540")
         self.resizable(True, True)
-        self.groq_key      = load_groq_key()
+        self.cerebras_key  = load_cerebras_key()
         self.gemini_key    = load_gemini_key()
+        self.groq_key      = load_groq_key()
         self._cancel_event = threading.Event()
         self._job_start    = None
         self._job_done     = 0
@@ -776,7 +877,7 @@ class SubtitleApp(_TK_BASE):
         # ── Top bar ──
         top = ttk.Frame(self, padding=(12, 10, 12, 4))
         top.grid(row=0, column=0, sticky='ew')
-        top.columnconfigure(5, weight=1)
+        top.columnconfigure(6, weight=1)
 
         ttk.Label(top, text="Hebrew Subtitle Generator",
                   font=('Segoe UI', 13, 'bold')).grid(
@@ -803,27 +904,31 @@ class SubtitleApp(_TK_BASE):
 
         self.gemini_btn = ttk.Button(top, text="✨ Gemini Key",
                                      command=self._set_gemini_key, width=14)
-        self.gemini_btn.grid(row=1, column=4, padx=(0, 6))
+        self.gemini_btn.grid(row=1, column=4, padx=(0, 4))
+
+        self.cerebras_btn = ttk.Button(top, text="⚡ Cerebras Key",
+                                       command=self._set_cerebras_key, width=15)
+        self.cerebras_btn.grid(row=1, column=5, padx=(0, 6))
 
         # File label (stretchy)
         self.file_var = tk.StringVar(value="No file selected")
         ttk.Label(top, textvariable=self.file_var,
-                  foreground='#666').grid(row=1, column=5, sticky='w', padx=(0, 16))
+                  foreground='#666').grid(row=1, column=6, sticky='w', padx=(0, 16))
 
         # Translator selector
-        ttk.Label(top, text="Translator:").grid(row=1, column=6, sticky='e', padx=(0, 4))
+        ttk.Label(top, text="Translator:").grid(row=1, column=7, sticky='e', padx=(0, 4))
         self.translator_var = tk.StringVar(value="Google Translate (free)")
         self.trans_combo = ttk.Combobox(
             top, textvariable=self.translator_var,
-            values=["Google Translate (free)"], state="readonly", width=32,
+            values=["Google Translate (free)"], state="readonly", width=28,
         )
-        self.trans_combo.grid(row=1, column=7, sticky='w')
+        self.trans_combo.grid(row=1, column=8, sticky='w')
 
         # DnD hint label
         if _HAS_DND:
             ttk.Label(top, text="(or drag & drop a file below)",
                       foreground='#888', font=('Segoe UI', 8)).grid(
-                row=2, column=0, columnspan=6, sticky='w', pady=(4, 0)
+                row=2, column=0, columnspan=7, sticky='w', pady=(4, 0)
             )
 
         # ── Log area ──
@@ -965,17 +1070,32 @@ class SubtitleApp(_TK_BASE):
                 level = 'warning' if pkg in ('ffsubsync', 'tkinterdnd2') else 'error'
                 self.log(f"  ✗ {pkg}  →  pip install {pkg}", level)
 
+        # Cerebras (fastest — check first)
+        self.log("Checking Cerebras API key…", 'dim')
+        if self.cerebras_key:
+            ok, err = check_cerebras(self.cerebras_key)
+            if ok:
+                self.log(f"  ✓ Cerebras ready ({CEREBRAS_MODEL})", 'success')
+            else:
+                self.log(f"  ✗ Cerebras key invalid: {err}", 'warning')
+                self.cerebras_key = ''
+        else:
+            self.log("  No Cerebras key — click '⚡ Cerebras Key' (fastest, free)", 'dim')
+            self.log("  Get a free key at: https://cloud.cerebras.ai", 'dim')
+
         # Gemini
         self.log("Checking Gemini API key…", 'dim')
         if self.gemini_key:
             ok, err = check_gemini(self.gemini_key)
             if ok:
                 self.log(f"  ✓ Gemini ready ({GEMINI_MODEL})", 'success')
+            elif '429' in err:
+                self.log(f"  ✓ Gemini key set ({GEMINI_MODEL}) — quota busy at startup, will retry during translation", 'success')
             else:
                 self.log(f"  ✗ Gemini key invalid: {err}", 'warning')
                 self.gemini_key = ''
         else:
-            self.log("  No Gemini key — click '✨ Gemini Key' (recommended, free & fast)", 'dim')
+            self.log("  No Gemini key — click '✨ Gemini Key' (free & fast)", 'dim')
             self.log("  Get a free key at: https://aistudio.google.com/apikey", 'dim')
 
         # Groq
@@ -988,7 +1108,7 @@ class SubtitleApp(_TK_BASE):
                 self.log(f"  ✗ Groq key invalid: {err}", 'warning')
                 self.groq_key = ''
 
-        if not self.gemini_key and not self.groq_key:
+        if not self.cerebras_key and not self.gemini_key and not self.groq_key:
             self.log("  No AI key set — will use Google Translate", 'warning')
 
         self._update_translator_options()
@@ -996,21 +1116,27 @@ class SubtitleApp(_TK_BASE):
 
     def _update_translator_options(self):
         def _do():
-            options = []
-            if self.gemini_key:
-                options.append(f"Gemini — {GEMINI_MODEL} (AI, fast & free)")
-            if self.groq_key:
-                options.append(f"Groq — {GROQ_MODEL} (AI, gender-aware)")
+            has_ai = bool(self.cerebras_key or self.gemini_key or self.groq_key)
+            chain  = []
+            if self.cerebras_key: chain.append("Cerebras")
+            if self.gemini_key:   chain.append("Gemini")
+            if self.groq_key:     chain.append("Groq")
+            chain.append("Google")
+            options = [f"AI auto-chain ({' → '.join(chain)})"] if has_ai else []
             options.append("Google Translate (free)")
             self.trans_combo['values'] = options
             self.trans_combo.current(0)
         self.after(0, _do)
 
-    def _use_gemini(self) -> str:
-        return self.gemini_key if self.translator_var.get().startswith("Gemini") else ''
-
-    def _use_groq(self) -> str:
-        return self.groq_key if self.translator_var.get().startswith("Groq") else ''
+    def _ai_keys(self) -> dict:
+        """Return AI keys only when AI mode is selected."""
+        if self.translator_var.get().startswith("AI"):
+            return {
+                'cerebras_key': self.cerebras_key,
+                'gemini_key':   self.gemini_key,
+                'groq_key':     self.groq_key,
+            }
+        return {'cerebras_key': '', 'gemini_key': '', 'groq_key': ''}
 
     def _set_groq_key(self):
         """Dialog to enter/update the Groq API key."""
@@ -1077,18 +1203,69 @@ class SubtitleApp(_TK_BASE):
             if not key:
                 messagebox.showwarning("Empty key", "Please enter a key.", parent=dlg)
                 return
-            self.log("Verifying Gemini key…", 'dim')
+            # Gemini free tier may 429 on the ping itself — accept the key if it
+            # looks valid (starts with "AIza") or if the ping succeeds.
+            if not key.startswith("AIza") and len(key) < 20:
+                messagebox.showerror("Invalid key",
+                    "This doesn't look like a valid Gemini API key.\n"
+                    "Keys start with 'AIza...'", parent=dlg)
+                return
+            self.log("Saving Gemini key…", 'dim')
             ok, err = check_gemini(key)
-            if ok:
+            if ok or '429' in err:  # 429 means key is valid but quota hit
                 self.gemini_key = key
                 save_gemini_key(key)
-                self.log(f"✓ Gemini key saved ({GEMINI_MODEL} ready)", 'success')
+                msg = f"✓ Gemini key saved ({GEMINI_MODEL} ready)" if ok else \
+                      f"✓ Gemini key saved (quota currently busy — will work for translation)"
+                self.log(msg, 'success')
                 self._update_translator_options()
                 dlg.destroy()
             else:
                 self.log(f"  ✗ Gemini verification failed: {err}", 'warning')
                 messagebox.showerror("Invalid key",
                     f"Could not connect to Gemini.\n\nError: {err}", parent=dlg)
+
+        bf = ttk.Frame(dlg)
+        bf.grid(row=3, column=0, columnspan=2, pady=(0, 12))
+        ttk.Button(bf, text="Save & Verify", command=_save).pack(side='left', padx=6)
+        ttk.Button(bf, text="Cancel", command=dlg.destroy).pack(side='left', padx=6)
+        entry.focus_set()
+        dlg.bind("<Return>", lambda _: _save())
+
+    def _set_cerebras_key(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("Cerebras API Key")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="Enter your free Cerebras API key:").grid(
+            row=0, column=0, columnspan=2, padx=16, pady=(14, 4), sticky='w')
+        ttk.Label(dlg, text="Get one free at https://cloud.cerebras.ai",
+                  foreground='#555').grid(
+            row=1, column=0, columnspan=2, padx=16, pady=(0, 8), sticky='w')
+
+        entry = ttk.Entry(dlg, width=52, show='')
+        entry.grid(row=2, column=0, columnspan=2, padx=16, pady=(0, 12))
+        if self.cerebras_key:
+            entry.insert(0, self.cerebras_key)
+
+        def _save():
+            key = entry.get().strip()
+            if not key:
+                messagebox.showwarning("Empty key", "Please enter a key.", parent=dlg)
+                return
+            self.log("Verifying Cerebras key…", 'dim')
+            ok, err = check_cerebras(key)
+            if ok:
+                self.cerebras_key = key
+                save_cerebras_key(key)
+                self.log(f"✓ Cerebras key saved ({CEREBRAS_MODEL} ready)", 'success')
+                self._update_translator_options()
+                dlg.destroy()
+            else:
+                self.log(f"  ✗ Cerebras verification failed: {err}", 'warning')
+                messagebox.showerror("Invalid key",
+                    f"Could not connect to Cerebras with this key.\n\nError: {err}", parent=dlg)
 
         bf = ttk.Frame(dlg)
         bf.grid(row=3, column=0, columnspan=2, pady=(0, 12))
@@ -1178,7 +1355,7 @@ class SubtitleApp(_TK_BASE):
             import pysubs2
             subs = pysubs2.load(sync_path)
             out  = str(p.parent / (p.stem + "_SYNC_HEB.srt"))
-            translate_and_save(subs, out, self.log, self._use_groq(), self._use_gemini(),
+            translate_and_save(subs, out, self.log, **self._ai_keys(),
                                cancel_check=self._should_cancel,
                                progress_cb=self.set_job_progress)
             self.log(f"Done! → {Path(out).name}", 'success')
