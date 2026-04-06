@@ -1791,6 +1791,8 @@ class SubtitleApp(_TK_BASE):
                 pending.append((ms, pool.submit(ocr_frame, frame.copy(), tess_lang)))
                 ocr_calls += 1
 
+                self.set_job_progress(ms, duration_ms)
+
                 if ms >= report_at:
                     pct = ms / duration_ms * 100
                     self.log(f"  OCR: {pct:.0f}%  ({ms // 60000}m)  "
