@@ -113,7 +113,7 @@ AI_CONFIG_PATH = Path.home() / ".hebrew_subtitle_config.json"
 
 # Cerebras (fastest inference — https://cloud.cerebras.ai)
 CEREBRAS_API_URL   = "https://api.cerebras.ai/v1/chat/completions"
-CEREBRAS_MODEL     = "llama-3.3-70b"
+CEREBRAS_MODEL     = "gpt-oss-120b"
 CEREBRAS_BATCH_SIZE  = 15
 CEREBRAS_BATCH_DELAY = 0.5   # wafer-scale chips — very fast, minimal delay needed
 CEREBRAS_TIMEOUT     = 60
