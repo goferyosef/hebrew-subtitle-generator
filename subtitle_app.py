@@ -490,8 +490,9 @@ def _ai_chat(api_url: str, model: str, key: str,
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())["choices"][0]["message"]["content"]
 
-def _cerebras_best_model(key: str) -> str:
-    """Query /v1/models and return the best available model for this account."""
+
+def check_cerebras(key: str) -> tuple:
+    """Verify key by listing models — no model name needed."""
     try:
         req = urllib.request.Request(
             "https://api.cerebras.ai/v1/models",
@@ -502,22 +503,23 @@ def _cerebras_best_model(key: str) -> str:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data   = json.loads(resp.read())
             models = [m["id"] for m in data.get("data", [])]
-        # Prefer larger models; fall back in order
-        for preferred in ("llama-3.3-70b", "gpt-oss-120b", "llama3.1-70b",
-                          "llama3.1-8b"):
-            if preferred in models:
-                return preferred
-        return models[0] if models else CEREBRAS_MODEL
-    except Exception:
-        return CEREBRAS_MODEL
-
-def check_cerebras(key: str) -> tuple:
-    model = _cerebras_best_model(key)
-    ok, err = _ai_check(CEREBRAS_API_URL, model, key)
-    if ok:
-        # Persist the discovered model so cerebras_chat uses the same one
+        if not models:
+            return False, "No models available for this account."
+        # Pick best model and persist it
+        model = next(
+            (m for m in ("llama-3.3-70b", "gpt-oss-120b", "llama3.1-70b",
+                         "llama3.1-8b") if m in models),
+            models[0]
+        )
         _save_config({**_load_config(), 'cerebras_model': model})
-    return ok, err
+        return True, ""
+    except urllib.error.HTTPError as e:
+        body = ""
+        try: body = e.read().decode(errors='replace')[:300]
+        except Exception: pass
+        return False, f"HTTP {e.code} {e.reason}: {body}"
+    except Exception as e:
+        return False, str(e)
 
 def cerebras_chat(system: str, user: str, key: str, timeout: int = CEREBRAS_TIMEOUT) -> str:
     model = _load_config().get('cerebras_model', CEREBRAS_MODEL)
