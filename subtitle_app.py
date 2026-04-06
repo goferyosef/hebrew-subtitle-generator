@@ -1451,7 +1451,7 @@ class SubtitleApp(_TK_BASE):
         if self._should_cancel():
             return
         out = str(p.parent / (p.stem + "_HEB.srt"))
-        translate_and_save(subs, out, self.log, self._use_groq(), self._use_gemini(),
+        translate_and_save(subs, out, self.log, **self._ai_keys(),
                            cancel_check=self._should_cancel,
                            progress_cb=self.set_job_progress)
         if not self._should_cancel():
@@ -1505,7 +1505,7 @@ class SubtitleApp(_TK_BASE):
 
         self.log(f"Loaded {len(subs.events)} entries")
         out = str(p.parent / (p.stem + "_HEB.srt"))
-        translate_and_save(subs, out, self.log, self._use_groq(), self._use_gemini(),
+        translate_and_save(subs, out, self.log, **self._ai_keys(),
                            cancel_check=self._should_cancel,
                            progress_cb=self.set_job_progress)
         if not self._should_cancel():
@@ -1605,7 +1605,7 @@ class SubtitleApp(_TK_BASE):
             return
 
         out = str(p.parent / (p.stem + "_HEB.srt"))
-        translate_and_save(subs, out, self.log, self._use_groq(), self._use_gemini(),
+        translate_and_save(subs, out, self.log, **self._ai_keys(),
                            cancel_check=self._should_cancel,
                            progress_cb=self.set_job_progress)
         if not self._should_cancel():
