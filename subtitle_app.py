@@ -108,13 +108,25 @@ GOOGLE_BATCH_SEP  = '\n\n@@SEP@@\n\n'
 GOOGLE_BATCH_MAX  = 4500
 GOOGLE_RATE_DELAY = 0.4
 
+# Shared config path for all AI keys
+AI_CONFIG_PATH = Path.home() / ".hebrew_subtitle_config.json"
+
 # Groq (free cloud AI — https://console.groq.com)
-GROQ_API_URL   = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL     = "llama-3.3-70b-versatile"
-GROQ_BATCH_SIZE = 15
-GROQ_CONTEXT    = 20      # lines of prior context kept for gender consistency
-GROQ_TIMEOUT    = 60
-GROQ_CONFIG_PATH = Path.home() / ".hebrew_subtitle_config.json"
+GROQ_API_URL     = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL       = "llama-3.3-70b-versatile"
+GROQ_BATCH_SIZE  = 10
+GROQ_BATCH_DELAY = 2.0
+GROQ_CONTEXT     = 20
+GROQ_TIMEOUT     = 60
+
+# Gemini Flash (free — https://aistudio.google.com)
+# Uses OpenAI-compatible endpoint; free tier: 15 RPM, 1M tokens/day
+GEMINI_API_URL     = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+GEMINI_MODEL       = "gemini-2.0-flash"
+GEMINI_BATCH_SIZE  = 20    # larger batches are fine — generous rate limits
+GEMINI_BATCH_DELAY = 1.0
+GEMINI_CONTEXT     = 20
+GEMINI_TIMEOUT     = 60
 
 # Hebrew RTL marker — prepended to each translated line so players display it correctly
 RTL_MARK = '\u200f'
@@ -143,6 +155,12 @@ TRANSLATION RULES — follow these exactly:
 # ─── Utility helpers ──────────────────────────────────────────────────────────
 
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+
+
+def _fmt_time(secs: int) -> str:
+    m, s = divmod(max(0, secs), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def run_cmd(*args, timeout=60):
@@ -375,36 +393,48 @@ def build_srt_from_ocr(lines: list):
 
 # ─── Groq AI Translation ──────────────────────────────────────────────────────
 
-def load_groq_key() -> str:
+def _load_config() -> dict:
     try:
-        if GROQ_CONFIG_PATH.exists():
-            return json.loads(GROQ_CONFIG_PATH.read_text(encoding='utf-8')).get('groq_api_key', '')
+        if AI_CONFIG_PATH.exists():
+            return json.loads(AI_CONFIG_PATH.read_text(encoding='utf-8'))
     except Exception:
         pass
-    return ''
+    return {}
+
+def _save_config(data: dict):
+    try:
+        AI_CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+
+def load_groq_key() -> str:
+    return _load_config().get('groq_api_key', '')
 
 def save_groq_key(key: str):
-    try:
-        data = {}
-        if GROQ_CONFIG_PATH.exists():
-            data = json.loads(GROQ_CONFIG_PATH.read_text(encoding='utf-8'))
-        data['groq_api_key'] = key.strip()
-        GROQ_CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding='utf-8')
-    except Exception:
-        pass
+    data = _load_config()
+    data['groq_api_key'] = key.strip()
+    _save_config(data)
 
-def check_groq(key: str) -> tuple:
-    """Returns (ok: bool, error_msg: str)."""
+def load_gemini_key() -> str:
+    return _load_config().get('gemini_api_key', '')
+
+def save_gemini_key(key: str):
+    data = _load_config()
+    data['gemini_api_key'] = key.strip()
+    _save_config(data)
+
+def _ai_check(api_url: str, model: str, key: str) -> tuple:
+    """Ping an OpenAI-compatible endpoint. Returns (ok, error_msg)."""
     if not key:
         return False, "No key provided."
     try:
         payload = json.dumps({
-            "model": GROQ_MODEL,
+            "model": model,
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 5,
         }).encode()
         req = urllib.request.Request(
-            GROQ_API_URL, data=payload,
+            api_url, data=payload,
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {key}",
                      "User-Agent": "Mozilla/5.0"},
@@ -424,9 +454,11 @@ def check_groq(key: str) -> tuple:
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 
-def groq_chat(system: str, user: str, key: str, timeout: int = GROQ_TIMEOUT) -> str:
+def _ai_chat(api_url: str, model: str, key: str,
+             system: str, user: str, timeout: int = 60) -> str:
+    """Single OpenAI-compatible chat completion call."""
     payload = json.dumps({
-        "model": GROQ_MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user",   "content": user},
@@ -435,7 +467,7 @@ def groq_chat(system: str, user: str, key: str, timeout: int = GROQ_TIMEOUT) -> 
         "max_tokens": 4096,
     }).encode()
     req = urllib.request.Request(
-        GROQ_API_URL, data=payload,
+        api_url, data=payload,
         headers={"Content-Type": "application/json",
                  "Authorization": f"Bearer {key}",
                  "User-Agent": "Mozilla/5.0"},
@@ -444,8 +476,20 @@ def groq_chat(system: str, user: str, key: str, timeout: int = GROQ_TIMEOUT) -> 
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())["choices"][0]["message"]["content"]
 
+def check_groq(key: str) -> tuple:
+    return _ai_check(GROQ_API_URL, GROQ_MODEL, key)
 
-def detect_character_genders(sample_texts: list, key: str, log_cb) -> str:
+def check_gemini(key: str) -> tuple:
+    return _ai_check(GEMINI_API_URL, GEMINI_MODEL, key)
+
+def groq_chat(system: str, user: str, key: str, timeout: int = GROQ_TIMEOUT) -> str:
+    return _ai_chat(GROQ_API_URL, GROQ_MODEL, key, system, user, timeout)
+
+def gemini_chat(system: str, user: str, key: str, timeout: int = GEMINI_TIMEOUT) -> str:
+    return _ai_chat(GEMINI_API_URL, GEMINI_MODEL, key, system, user, timeout)
+
+
+def detect_character_genders(sample_texts: list, chat_fn, log_cb) -> str:
     if not sample_texts:
         return ""
     # Sample evenly across the whole file (up to 80 lines) for better coverage
@@ -459,9 +503,9 @@ def detect_character_genders(sample_texts: list, key: str, log_cb) -> str:
         f"Lines:\n{numbered}"
     )
     try:
-        response = groq_chat(
+        response = chat_fn(
             "You are a script analyst. Identify character names and genders from dialogue. Return only valid JSON.",
-            user_msg, key, timeout=30,
+            user_msg,
         )
         m = re.search(r'\{[\s\S]*\}', response)
         if m:
@@ -493,7 +537,7 @@ def _parse_llm_json(response: str, n: int) -> list:
     raise ValueError(f"Could not parse {n} items from response")
 
 
-def _groq_translate_batch(texts: list, key: str, system: str, context_window: list) -> list:
+def _ai_translate_batch(texts: list, chat_fn, system: str, context_window: list) -> list:
     ctx = ""
     if context_window:
         ctx = "RECENT CONTEXT (already translated — reference only, do NOT retranslate):\n"
@@ -503,86 +547,106 @@ def _groq_translate_batch(texts: list, key: str, system: str, context_window: li
         f"{ctx}Translate these {len(texts)} subtitle lines to Hebrew.\n"
         f"Return ONLY a JSON array of exactly {len(texts)} Hebrew strings:\n\n{numbered}"
     )
-    return _parse_llm_json(groq_chat(system, user_msg, key), len(texts))
+    return _parse_llm_json(chat_fn(system, user_msg), len(texts))
 
 
-def _groq_full_translate(raw_texts: list, key: str, log_cb, cancel_check=None) -> list:
+def _ai_full_translate(raw_texts: list, chat_fn, label: str, batch_size: int,
+                       batch_delay: float, context_size: int,
+                       log_cb, cancel_check=None, progress_cb=None) -> list:
     clean_texts = [strip_sub_tags(t) for t in raw_texts]
     log_cb("  Detecting character genders…", 'dim')
-    gender_block = detect_character_genders([t for t in clean_texts if t], key, log_cb)
+    gender_block = detect_character_genders([t for t in clean_texts if t], chat_fn, log_cb)
     system       = HEBREW_SYSTEM_PROMPT.format(gender_block=gender_block)
 
     results        = list(raw_texts)
     context_window = []
     total          = len(raw_texts)
 
-    for batch_start in range(0, total, GROQ_BATCH_SIZE):
+    for batch_start in range(0, total, batch_size):
         if cancel_check and cancel_check():
             log_cb("  Cancelled.", 'warning')
             return results
 
-        batch_raw   = raw_texts[batch_start : batch_start + GROQ_BATCH_SIZE]
-        batch_clean = clean_texts[batch_start : batch_start + GROQ_BATCH_SIZE]
+        batch_raw   = raw_texts[batch_start : batch_start + batch_size]
+        batch_clean = clean_texts[batch_start : batch_start + batch_size]
         non_empty   = [(j, t) for j, t in enumerate(batch_clean) if t.strip()]
 
         if not non_empty:
             continue
 
-        # Retry with backoff on 429, fall back to Google only after exhausting retries
+        batch_num = batch_start // batch_size + 1
         for attempt in range(4):
             try:
-                translated = _groq_translate_batch([t for _, t in non_empty], key, system, context_window)
+                translated = _ai_translate_batch([t for _, t in non_empty], chat_fn, system, context_window)
                 for (j, _), heb in zip(non_empty, translated):
                     results[batch_start + j] = RTL_MARK + heb
                     context_window.append(heb)
-                context_window = context_window[-GROQ_CONTEXT:]
+                context_window = context_window[-context_size:]
                 break
-            except urllib.error.HTTPError as e:
-                if e.code == 429 and attempt < 3:
-                    wait = 15 * (attempt + 1)
-                    log_cb(f"  Rate limited — waiting {wait}s…", 'dim')
+            except (urllib.error.HTTPError, ValueError) as e:
+                is_rate_limit = isinstance(e, urllib.error.HTTPError) and e.code == 429
+                if (is_rate_limit or isinstance(e, ValueError)) and attempt < 3:
+                    wait = 15 * (attempt + 1) if is_rate_limit else 3 * (attempt + 1)
+                    reason = "Rate limited" if is_rate_limit else "Parse error"
+                    log_cb(f"  {reason} on batch {batch_num}, retry {attempt + 1}/3 in {wait}s…", 'dim')
                     time.sleep(wait)
                 else:
-                    log_cb(f"  Batch {batch_start // GROQ_BATCH_SIZE + 1} failed ({e}) — Google fallback", 'warning')
-                    try:
-                        from deep_translator import GoogleTranslator
-                        gt = GoogleTranslator(source='auto', target='iw')
-                        for j, text in enumerate(batch_clean):
-                            if text.strip():
-                                try:
-                                    results[batch_start + j] = RTL_MARK + gt.translate(text)
-                                    time.sleep(0.2)
-                                except Exception:
-                                    pass
-                    except ImportError:
-                        pass
+                    log_cb(f"  Batch {batch_num} failed ({e}) — Google fallback", 'warning')
+                    _google_translate_lines(batch_clean, batch_start, results, log_cb)
                     break
             except Exception as e:
-                log_cb(f"  Batch {batch_start // GROQ_BATCH_SIZE + 1} failed ({e}) — Google fallback", 'warning')
-                try:
-                    from deep_translator import GoogleTranslator
-                    gt = GoogleTranslator(source='auto', target='iw')
-                    for j, text in enumerate(batch_clean):
-                        if text.strip():
-                            try:
-                                results[batch_start + j] = RTL_MARK + gt.translate(text)
-                                time.sleep(0.2)
-                            except Exception:
-                                pass
-                except ImportError:
-                    pass
+                log_cb(f"  Batch {batch_num} failed ({e}) — Google fallback", 'warning')
+                _google_translate_lines(batch_clean, batch_start, results, log_cb)
                 break
 
-        done = min(batch_start + GROQ_BATCH_SIZE, total)
-        if done % 60 == 0 or done == total:
+        time.sleep(batch_delay)
+        done = min(batch_start + batch_size, total)
+        if progress_cb:
+            progress_cb(done, total)
+        if done % 50 == 0 or done == total:
             log_cb(f"  {done}/{total} lines translated", 'dim')
 
     return results
 
 
+def _google_translate_lines(batch_clean, batch_start, results, log_cb):
+    try:
+        from deep_translator import GoogleTranslator
+        gt = GoogleTranslator(source='auto', target='iw')
+        for j, text in enumerate(batch_clean):
+            if text.strip():
+                try:
+                    results[batch_start + j] = RTL_MARK + gt.translate(text)
+                    time.sleep(0.2)
+                except Exception:
+                    pass
+    except ImportError:
+        pass
+
+
+def _groq_full_translate(raw_texts, key, log_cb, cancel_check=None, progress_cb=None):
+    return _ai_full_translate(
+        raw_texts,
+        chat_fn=lambda sys, usr: groq_chat(sys, usr, key),
+        label="Groq", batch_size=GROQ_BATCH_SIZE, batch_delay=GROQ_BATCH_DELAY,
+        context_size=GROQ_CONTEXT, log_cb=log_cb,
+        cancel_check=cancel_check, progress_cb=progress_cb,
+    )
+
+
+def _gemini_full_translate(raw_texts, key, log_cb, cancel_check=None, progress_cb=None):
+    return _ai_full_translate(
+        raw_texts,
+        chat_fn=lambda sys, usr: gemini_chat(sys, usr, key),
+        label="Gemini", batch_size=GEMINI_BATCH_SIZE, batch_delay=GEMINI_BATCH_DELAY,
+        context_size=GEMINI_CONTEXT, log_cb=log_cb,
+        cancel_check=cancel_check, progress_cb=progress_cb,
+    )
+
+
 # ─── Google Translate (fallback) ──────────────────────────────────────────────
 
-def _google_batch_translate(texts: list, log_cb, cancel_check=None) -> list:
+def _google_batch_translate(texts: list, log_cb, cancel_check=None, progress_cb=None) -> list:
     from deep_translator import GoogleTranslator
     translator = GoogleTranslator(source='auto', target='iw')
     results    = list(texts)
@@ -625,6 +689,8 @@ def _google_batch_translate(texts: list, log_cb, cancel_check=None) -> list:
             continue
         if batch_chars + len(clean) + len(GOOGLE_BATCH_SEP) > GOOGLE_BATCH_MAX and batch_t:
             flush(batch_t, batch_i)
+            if progress_cb:
+                progress_cb(i, len(texts))
             time.sleep(GOOGLE_RATE_DELAY)
             batch_t, batch_i, batch_chars = [], [], 0
             if i % 100 == 0:
@@ -641,7 +707,8 @@ def _google_batch_translate(texts: list, log_cb, cancel_check=None) -> list:
 # ─── Translation dispatcher ───────────────────────────────────────────────────
 
 def translate_and_save(subs, out_path: str, log_cb,
-                       groq_key: str = None, cancel_check=None):
+                       groq_key: str = None, gemini_key: str = None,
+                       cancel_check=None, progress_cb=None):
     import pysubs2
 
     with_text = [(i, e) for i, e in enumerate(subs.events) if strip_sub_tags(e.text)]
@@ -652,14 +719,19 @@ def translate_and_save(subs, out_path: str, log_cb,
 
     raw_texts = [e.text for _, e in with_text]
     log_cb(f"Translating {len(raw_texts)} lines…")
+    if progress_cb:
+        progress_cb(0, len(raw_texts))
 
-    if groq_key:
+    if gemini_key:
+        log_cb(f"  Gemini ({GEMINI_MODEL}) — AI, gender-aware")
+        translated = _gemini_full_translate(raw_texts, gemini_key, log_cb, cancel_check, progress_cb)
+    elif groq_key:
         log_cb(f"  Groq ({GROQ_MODEL}) — AI, gender-aware")
-        translated = _groq_full_translate(raw_texts, groq_key, log_cb, cancel_check)
+        translated = _groq_full_translate(raw_texts, groq_key, log_cb, cancel_check, progress_cb)
     else:
         log_cb("  Google Translate (free)")
         try:
-            translated = _google_batch_translate(raw_texts, log_cb, cancel_check)
+            translated = _google_batch_translate(raw_texts, log_cb, cancel_check, progress_cb)
         except ImportError:
             log_cb("deep-translator not installed — pip install deep-translator", 'error')
             return
@@ -686,7 +758,12 @@ class SubtitleApp(_TK_BASE):
         self.geometry("780x540")
         self.resizable(True, True)
         self.groq_key      = load_groq_key()
+        self.gemini_key    = load_gemini_key()
         self._cancel_event = threading.Event()
+        self._job_start    = None
+        self._job_done     = 0
+        self._job_total    = 0
+        self._timer_id     = None
         self._build_widgets()
         self.after(200, self._check_dependencies)
 
@@ -699,7 +776,7 @@ class SubtitleApp(_TK_BASE):
         # ── Top bar ──
         top = ttk.Frame(self, padding=(12, 10, 12, 4))
         top.grid(row=0, column=0, sticky='ew')
-        top.columnconfigure(4, weight=1)
+        top.columnconfigure(5, weight=1)
 
         ttk.Label(top, text="Hebrew Subtitle Generator",
                   font=('Segoe UI', 13, 'bold')).grid(
@@ -722,21 +799,25 @@ class SubtitleApp(_TK_BASE):
 
         self.groq_btn = ttk.Button(top, text="🔑 Groq Key",
                                    command=self._set_groq_key, width=12)
-        self.groq_btn.grid(row=1, column=3, padx=(0, 6))
+        self.groq_btn.grid(row=1, column=3, padx=(0, 4))
+
+        self.gemini_btn = ttk.Button(top, text="✨ Gemini Key",
+                                     command=self._set_gemini_key, width=14)
+        self.gemini_btn.grid(row=1, column=4, padx=(0, 6))
 
         # File label (stretchy)
         self.file_var = tk.StringVar(value="No file selected")
         ttk.Label(top, textvariable=self.file_var,
-                  foreground='#666').grid(row=1, column=4, sticky='w', padx=(0, 16))
+                  foreground='#666').grid(row=1, column=5, sticky='w', padx=(0, 16))
 
         # Translator selector
-        ttk.Label(top, text="Translator:").grid(row=1, column=5, sticky='e', padx=(0, 4))
+        ttk.Label(top, text="Translator:").grid(row=1, column=6, sticky='e', padx=(0, 4))
         self.translator_var = tk.StringVar(value="Google Translate (free)")
         self.trans_combo = ttk.Combobox(
             top, textvariable=self.translator_var,
             values=["Google Translate (free)"], state="readonly", width=32,
         )
-        self.trans_combo.grid(row=1, column=6, sticky='w')
+        self.trans_combo.grid(row=1, column=7, sticky='w')
 
         # DnD hint label
         if _HAS_DND:
@@ -777,11 +858,15 @@ class SubtitleApp(_TK_BASE):
         bot.columnconfigure(0, weight=1)
 
         self.progress = ttk.Progressbar(bot, mode='indeterminate')
-        self.progress.grid(row=0, column=0, sticky='ew', pady=(0, 4))
+        self.progress.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(0, 4))
 
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(bot, textvariable=self.status_var,
                   foreground='#555').grid(row=1, column=0, sticky='w')
+
+        self.time_var = tk.StringVar(value="")
+        ttk.Label(bot, textvariable=self.time_var,
+                  foreground='#555', font=('Segoe UI', 9)).grid(row=1, column=1, sticky='e')
 
     # ── Drag and drop ──────────────────────────────────────────────────────────
 
@@ -817,6 +902,40 @@ class SubtitleApp(_TK_BASE):
                 self.progress['value'] = 0
         self.after(0, _do)
 
+    # ── Timer ──────────────────────────────────────────────────────────────────
+
+    def _start_timer(self):
+        self._job_start = time.time()
+        self._job_done  = 0
+        self._job_total = 0
+        self.time_var.set("")
+        self._tick_timer()
+
+    def _tick_timer(self):
+        if self._job_start is None:
+            return
+        elapsed = time.time() - self._job_start
+        eta_str = "--:--"
+        if self._job_total > 0 and self._job_done > 0:
+            rate = self._job_done / elapsed
+            eta_str = _fmt_time(int((self._job_total - self._job_done) / rate))
+        self.time_var.set(f"Elapsed: {_fmt_time(int(elapsed))}  ETA: {eta_str}")
+        self._timer_id = self.after(1000, self._tick_timer)
+
+    def _stop_timer(self):
+        if self._timer_id:
+            self.after_cancel(self._timer_id)
+            self._timer_id = None
+        if self._job_start:
+            total = _fmt_time(int(time.time() - self._job_start))
+            self.time_var.set(f"Total: {total}")
+        self._job_start = None
+
+    def set_job_progress(self, done: int, total: int):
+        """Called from worker thread — safe to set plain ints."""
+        self._job_done  = done
+        self._job_total = total
+
     # ── Dependency & Ollama detection ─────────────────────────────────────────
 
     def _check_dependencies(self):
@@ -846,6 +965,19 @@ class SubtitleApp(_TK_BASE):
                 level = 'warning' if pkg in ('ffsubsync', 'tkinterdnd2') else 'error'
                 self.log(f"  ✗ {pkg}  →  pip install {pkg}", level)
 
+        # Gemini
+        self.log("Checking Gemini API key…", 'dim')
+        if self.gemini_key:
+            ok, err = check_gemini(self.gemini_key)
+            if ok:
+                self.log(f"  ✓ Gemini ready ({GEMINI_MODEL})", 'success')
+            else:
+                self.log(f"  ✗ Gemini key invalid: {err}", 'warning')
+                self.gemini_key = ''
+        else:
+            self.log("  No Gemini key — click '✨ Gemini Key' (recommended, free & fast)", 'dim')
+            self.log("  Get a free key at: https://aistudio.google.com/apikey", 'dim')
+
         # Groq
         self.log("Checking Groq API key…", 'dim')
         if self.groq_key:
@@ -853,12 +985,11 @@ class SubtitleApp(_TK_BASE):
             if ok:
                 self.log(f"  ✓ Groq ready ({GROQ_MODEL})", 'success')
             else:
-                self.log(f"  ✗ Groq key invalid or connection failed: {err}", 'warning')
+                self.log(f"  ✗ Groq key invalid: {err}", 'warning')
                 self.groq_key = ''
-        else:
-            self.log("  No Groq key set → using Google Translate", 'warning')
-            self.log("  For better Hebrew: click '🔑 Groq Key' and enter your free key", 'dim')
-            self.log("  Get a free key at: https://console.groq.com", 'dim')
+
+        if not self.gemini_key and not self.groq_key:
+            self.log("  No AI key set — will use Google Translate", 'warning')
 
         self._update_translator_options()
         self.log("Ready.", 'success')
@@ -866,6 +997,8 @@ class SubtitleApp(_TK_BASE):
     def _update_translator_options(self):
         def _do():
             options = []
+            if self.gemini_key:
+                options.append(f"Gemini — {GEMINI_MODEL} (AI, fast & free)")
             if self.groq_key:
                 options.append(f"Groq — {GROQ_MODEL} (AI, gender-aware)")
             options.append("Google Translate (free)")
@@ -873,11 +1006,11 @@ class SubtitleApp(_TK_BASE):
             self.trans_combo.current(0)
         self.after(0, _do)
 
+    def _use_gemini(self) -> str:
+        return self.gemini_key if self.translator_var.get().startswith("Gemini") else ''
+
     def _use_groq(self) -> str:
-        """Return Groq key if Groq is selected, else empty string."""
-        if self.translator_var.get().startswith("Groq"):
-            return self.groq_key
-        return ''
+        return self.groq_key if self.translator_var.get().startswith("Groq") else ''
 
     def _set_groq_key(self):
         """Dialog to enter/update the Groq API key."""
@@ -914,6 +1047,48 @@ class SubtitleApp(_TK_BASE):
                 self.log(f"  ✗ Groq verification failed: {err}", 'warning')
                 messagebox.showerror("Invalid key",
                     f"Could not connect to Groq with this key.\n\nError: {err}", parent=dlg)
+
+        bf = ttk.Frame(dlg)
+        bf.grid(row=3, column=0, columnspan=2, pady=(0, 12))
+        ttk.Button(bf, text="Save & Verify", command=_save).pack(side='left', padx=6)
+        ttk.Button(bf, text="Cancel", command=dlg.destroy).pack(side='left', padx=6)
+        entry.focus_set()
+        dlg.bind("<Return>", lambda _: _save())
+
+    def _set_gemini_key(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("Gemini API Key")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="Enter your free Gemini API key:").grid(
+            row=0, column=0, columnspan=2, padx=16, pady=(14, 4), sticky='w')
+        ttk.Label(dlg, text="Get one free at https://aistudio.google.com/apikey",
+                  foreground='#555').grid(
+            row=1, column=0, columnspan=2, padx=16, pady=(0, 8), sticky='w')
+
+        entry = ttk.Entry(dlg, width=52, show='')
+        entry.grid(row=2, column=0, columnspan=2, padx=16, pady=(0, 12))
+        if self.gemini_key:
+            entry.insert(0, self.gemini_key)
+
+        def _save():
+            key = entry.get().strip()
+            if not key:
+                messagebox.showwarning("Empty key", "Please enter a key.", parent=dlg)
+                return
+            self.log("Verifying Gemini key…", 'dim')
+            ok, err = check_gemini(key)
+            if ok:
+                self.gemini_key = key
+                save_gemini_key(key)
+                self.log(f"✓ Gemini key saved ({GEMINI_MODEL} ready)", 'success')
+                self._update_translator_options()
+                dlg.destroy()
+            else:
+                self.log(f"  ✗ Gemini verification failed: {err}", 'warning')
+                messagebox.showerror("Invalid key",
+                    f"Could not connect to Gemini.\n\nError: {err}", parent=dlg)
 
         bf = ttk.Frame(dlg)
         bf.grid(row=3, column=0, columnspan=2, pady=(0, 12))
@@ -1003,9 +1178,15 @@ class SubtitleApp(_TK_BASE):
             import pysubs2
             subs = pysubs2.load(sync_path)
             out  = str(p.parent / (p.stem + "_SYNC_HEB.srt"))
-            translate_and_save(subs, out, self.log, self._use_groq(),
-                               cancel_check=self._should_cancel)
+            translate_and_save(subs, out, self.log, self._use_groq(), self._use_gemini(),
+                               cancel_check=self._should_cancel,
+                               progress_cb=self.set_job_progress)
             self.log(f"Done! → {Path(out).name}", 'success')
+            try:
+                Path(sync_path).unlink()
+                self.log(f"Deleted: {Path(sync_path).name}", 'dim')
+            except Exception:
+                pass
 
     # ── Cancel ─────────────────────────────────────────────────────────────────
 
@@ -1026,6 +1207,7 @@ class SubtitleApp(_TK_BASE):
         self.cancel_btn.configure(state=tk.NORMAL)
         self.trans_combo.configure(state=tk.DISABLED)
         self.set_status("Processing…", running=True)
+        self._start_timer()
         threading.Thread(target=self._wrap, args=(func, *args), daemon=True).start()
 
     def _wrap(self, func, *args):
@@ -1040,6 +1222,7 @@ class SubtitleApp(_TK_BASE):
             self.set_status("Ready", running=False)
 
     def _restore_ui(self):
+        self._stop_timer()
         self.open_btn.configure(state=tk.NORMAL)
         self.sync_btn.configure(state=tk.NORMAL)
         self.cancel_btn.configure(state=tk.DISABLED)
@@ -1061,8 +1244,9 @@ class SubtitleApp(_TK_BASE):
         if self._should_cancel():
             return
         out = str(p.parent / (p.stem + "_HEB.srt"))
-        translate_and_save(subs, out, self.log, self._use_groq(),
-                           cancel_check=self._should_cancel)
+        translate_and_save(subs, out, self.log, self._use_groq(), self._use_gemini(),
+                           cancel_check=self._should_cancel,
+                           progress_cb=self.set_job_progress)
         if not self._should_cancel():
             self.log(f"Done! → {out}", 'success')
 
@@ -1114,10 +1298,16 @@ class SubtitleApp(_TK_BASE):
 
         self.log(f"Loaded {len(subs.events)} entries")
         out = str(p.parent / (p.stem + "_HEB.srt"))
-        translate_and_save(subs, out, self.log, self._use_groq(),
-                           cancel_check=self._should_cancel)
+        translate_and_save(subs, out, self.log, self._use_groq(), self._use_gemini(),
+                           cancel_check=self._should_cancel,
+                           progress_cb=self.set_job_progress)
         if not self._should_cancel():
             self.log(f"Done! → {out}", 'success')
+            try:
+                Path(srt_path).unlink()
+                self.log(f"Deleted: {Path(srt_path).name}", 'dim')
+            except Exception:
+                pass
 
     # ── Pipeline 3: hard-coded OCR ────────────────────────────────────────────
 
@@ -1208,10 +1398,16 @@ class SubtitleApp(_TK_BASE):
             return
 
         out = str(p.parent / (p.stem + "_HEB.srt"))
-        translate_and_save(subs, out, self.log, self._use_groq(),
-                           cancel_check=self._should_cancel)
+        translate_and_save(subs, out, self.log, self._use_groq(), self._use_gemini(),
+                           cancel_check=self._should_cancel,
+                           progress_cb=self.set_job_progress)
         if not self._should_cancel():
             self.log(f"Done! → {out}", 'success')
+            try:
+                Path(raw_path).unlink()
+                self.log(f"Deleted: {Path(raw_path).name}", 'dim')
+            except Exception:
+                pass
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
