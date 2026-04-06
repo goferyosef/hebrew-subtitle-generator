@@ -33,10 +33,36 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 
+# ─── ffmpeg / ffprobe auto-detect ────────────────────────────────────────────
+# Prefer imageio_ffmpeg for ffmpeg (full build with all encoders/muxers).
+# Use static_ffmpeg for ffprobe.
+def _configure_ffmpeg():
+    # Always prefer imageio_ffmpeg (full build) for ffmpeg — static_ffmpeg's
+    # win32 build is missing the SRT encoder. Prepend its dir so it wins PATH.
+    try:
+        import imageio_ffmpeg
+        src = Path(imageio_ffmpeg.get_ffmpeg_exe())
+        dst = src.parent / 'ffmpeg.exe'
+        if not dst.exists():
+            shutil.copy2(src, dst)
+        os.environ['PATH'] = str(src.parent) + ';' + os.environ.get('PATH', '')
+    except ImportError:
+        pass
+    # static_ffmpeg provides ffprobe
+    if not shutil.which('ffprobe'):
+        try:
+            import static_ffmpeg
+            static_ffmpeg.add_paths()
+        except ImportError:
+            pass
+_configure_ffmpeg()
+
+
 # ─── Tesseract auto-detect (finds it even if not in PATH) ────────────────────
 _TESSERACT_KNOWN = [
     r'C:\Program Files\Tesseract-OCR\tesseract.exe',
     r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+    str(Path.home() / 'AppData' / 'Local' / 'Tesseract-OCR' / 'tesseract.exe'),
 ]
 def _configure_tesseract():
     if shutil.which('tesseract'):
@@ -121,7 +147,7 @@ _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
 
 def run_cmd(*args, timeout=60):
     return subprocess.run(
-        list(args), capture_output=True, text=True,
+        list(args), capture_output=True, text=True, encoding='utf-8', errors='replace',
         timeout=timeout, creationflags=_NO_WINDOW,
     )
 
@@ -158,8 +184,10 @@ def probe_subtitle_streams(video_path: str) -> list:
 def select_best_stream(streams: list) -> tuple:
     def lang(s):  return s.get('tags', {}).get('language', '').lower()
     def codec(s): return s.get('codec_name', '').lower()
-    text_streams  = [(i, s) for i, s in enumerate(streams) if codec(s) in TEXT_CODECS]
-    image_streams = [(i, s) for i, s in enumerate(streams) if codec(s) in IMAGE_CODECS]
+    # Use the absolute stream index from ffprobe data, not the enumeration index
+    def idx(i, s): return s.get('index', i)
+    text_streams  = [(idx(i, s), s) for i, s in enumerate(streams) if codec(s) in TEXT_CODECS]
+    image_streams = [(idx(i, s), s) for i, s in enumerate(streams) if codec(s) in IMAGE_CODECS]
     for i, s in text_streams:
         lg = lang(s)
         if lg and lg not in HEBREW_LANG_TAGS and lg not in ENGLISH_LANG_TAGS:
@@ -175,12 +203,14 @@ def select_best_stream(streams: list) -> tuple:
 # ─── Soft subtitle extraction ─────────────────────────────────────────────────
 
 def extract_soft_subtitles(video_path: str, stream_index: int, out_path: str):
-    for codec in ('srt', 'subrip'):
-        run_cmd('ffmpeg', '-y', '-i', video_path,
-                '-map', f'0:{stream_index}', '-c:s', codec, out_path, timeout=120)
+    last_err = ""
+    for codec in ('srt', 'subrip', 'copy'):
+        r = run_cmd('ffmpeg', '-y', '-i', video_path,
+                    '-map', f'0:{stream_index}', '-c:s', codec, out_path, timeout=120)
         if Path(out_path).exists() and Path(out_path).stat().st_size > 0:
             return
-    raise RuntimeError("ffmpeg failed to extract subtitle stream.")
+        last_err = (r.stderr or r.stdout)[-500:]
+    raise RuntimeError(f"ffmpeg failed to extract subtitle stream.\n{last_err}")
 
 
 # ─── Auto-sync (ffsubsync) ────────────────────────────────────────────────────
@@ -363,9 +393,10 @@ def save_groq_key(key: str):
     except Exception:
         pass
 
-def check_groq(key: str) -> bool:
+def check_groq(key: str) -> tuple:
+    """Returns (ok: bool, error_msg: str)."""
     if not key:
-        return False
+        return False, "No key provided."
     try:
         payload = json.dumps({
             "model": GROQ_MODEL,
@@ -375,13 +406,23 @@ def check_groq(key: str) -> bool:
         req = urllib.request.Request(
             GROQ_API_URL, data=payload,
             headers={"Content-Type": "application/json",
-                     "Authorization": f"Bearer {key}"},
+                     "Authorization": f"Bearer {key}",
+                     "User-Agent": "Mozilla/5.0"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status == 200
-    except Exception:
-        return False
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status == 200, ""
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode(errors='replace')[:300]
+        except Exception:
+            pass
+        return False, f"HTTP {e.code} {e.reason}: {body}"
+    except urllib.error.URLError as e:
+        return False, f"Network error: {e.reason}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 def groq_chat(system: str, user: str, key: str, timeout: int = GROQ_TIMEOUT) -> str:
     payload = json.dumps({
@@ -396,7 +437,8 @@ def groq_chat(system: str, user: str, key: str, timeout: int = GROQ_TIMEOUT) -> 
     req = urllib.request.Request(
         GROQ_API_URL, data=payload,
         headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {key}"},
+                 "Authorization": f"Bearer {key}",
+                 "User-Agent": "Mozilla/5.0"},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -486,26 +528,50 @@ def _groq_full_translate(raw_texts: list, key: str, log_cb, cancel_check=None) -
         if not non_empty:
             continue
 
-        try:
-            translated = _groq_translate_batch([t for _, t in non_empty], key, system, context_window)
-            for (j, _), heb in zip(non_empty, translated):
-                results[batch_start + j] = RTL_MARK + heb
-                context_window.append(heb)
-            context_window = context_window[-GROQ_CONTEXT:]
-        except Exception as e:
-            log_cb(f"  Batch {batch_start // GROQ_BATCH_SIZE + 1} failed ({e}) — Google fallback", 'warning')
+        # Retry with backoff on 429, fall back to Google only after exhausting retries
+        for attempt in range(4):
             try:
-                from deep_translator import GoogleTranslator
-                gt = GoogleTranslator(source='auto', target='iw')
-                for j, text in enumerate(batch_clean):
-                    if text.strip():
-                        try:
-                            results[batch_start + j] = RTL_MARK + gt.translate(text)
-                            time.sleep(0.2)
-                        except Exception:
-                            pass
-            except ImportError:
-                pass
+                translated = _groq_translate_batch([t for _, t in non_empty], key, system, context_window)
+                for (j, _), heb in zip(non_empty, translated):
+                    results[batch_start + j] = RTL_MARK + heb
+                    context_window.append(heb)
+                context_window = context_window[-GROQ_CONTEXT:]
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < 3:
+                    wait = 15 * (attempt + 1)
+                    log_cb(f"  Rate limited — waiting {wait}s…", 'dim')
+                    time.sleep(wait)
+                else:
+                    log_cb(f"  Batch {batch_start // GROQ_BATCH_SIZE + 1} failed ({e}) — Google fallback", 'warning')
+                    try:
+                        from deep_translator import GoogleTranslator
+                        gt = GoogleTranslator(source='auto', target='iw')
+                        for j, text in enumerate(batch_clean):
+                            if text.strip():
+                                try:
+                                    results[batch_start + j] = RTL_MARK + gt.translate(text)
+                                    time.sleep(0.2)
+                                except Exception:
+                                    pass
+                    except ImportError:
+                        pass
+                    break
+            except Exception as e:
+                log_cb(f"  Batch {batch_start // GROQ_BATCH_SIZE + 1} failed ({e}) — Google fallback", 'warning')
+                try:
+                    from deep_translator import GoogleTranslator
+                    gt = GoogleTranslator(source='auto', target='iw')
+                    for j, text in enumerate(batch_clean):
+                        if text.strip():
+                            try:
+                                results[batch_start + j] = RTL_MARK + gt.translate(text)
+                                time.sleep(0.2)
+                            except Exception:
+                                pass
+                except ImportError:
+                    pass
+                break
 
         done = min(batch_start + GROQ_BATCH_SIZE, total)
         if done % 60 == 0 or done == total:
@@ -783,10 +849,11 @@ class SubtitleApp(_TK_BASE):
         # Groq
         self.log("Checking Groq API key…", 'dim')
         if self.groq_key:
-            if check_groq(self.groq_key):
+            ok, err = check_groq(self.groq_key)
+            if ok:
                 self.log(f"  ✓ Groq ready ({GROQ_MODEL})", 'success')
             else:
-                self.log("  ✗ Groq key invalid or connection failed", 'warning')
+                self.log(f"  ✗ Groq key invalid or connection failed: {err}", 'warning')
                 self.groq_key = ''
         else:
             self.log("  No Groq key set → using Google Translate", 'warning')
@@ -836,16 +903,17 @@ class SubtitleApp(_TK_BASE):
                 messagebox.showwarning("Empty key", "Please enter a key.", parent=dlg)
                 return
             self.log("Verifying Groq key…", 'dim')
-            if check_groq(key):
+            ok, err = check_groq(key)
+            if ok:
                 self.groq_key = key
                 save_groq_key(key)
                 self.log(f"✓ Groq key saved ({GROQ_MODEL} ready)", 'success')
                 self._update_translator_options()
                 dlg.destroy()
             else:
+                self.log(f"  ✗ Groq verification failed: {err}", 'warning')
                 messagebox.showerror("Invalid key",
-                    "Could not connect to Groq with this key.\n"
-                    "Check the key and your internet connection.", parent=dlg)
+                    f"Could not connect to Groq with this key.\n\nError: {err}", parent=dlg)
 
         bf = ttk.Frame(dlg)
         bf.grid(row=3, column=0, columnspan=2, pady=(0, 12))
@@ -1019,12 +1087,19 @@ class SubtitleApp(_TK_BASE):
             self._process_video_ocr(path)
             return
 
-        lang  = streams[idx].get('tags', {}).get('language', 'unknown')
-        codec = streams[idx].get('codec_name', 'unknown')
+        stream_info = next((s for s in streams if s.get('index') == idx), streams[0])
+        lang  = stream_info.get('tags', {}).get('language', 'unknown')
+        codec = stream_info.get('codec_name', 'unknown')
         self.log(f"Extracting stream {idx}  (lang={lang}, codec={codec})")
 
         srt_path = str(p.parent / (p.stem + ".srt"))
-        extract_soft_subtitles(path, idx, srt_path)
+        try:
+            extract_soft_subtitles(path, idx, srt_path)
+        except RuntimeError as e:
+            self.log(str(e), 'error')
+            self.log("Falling back to OCR mode…", 'warning')
+            self._process_video_ocr(path)
+            return
         self.log(f"Extracted → {p.stem}.srt", 'success')
 
         if self._should_cancel():
