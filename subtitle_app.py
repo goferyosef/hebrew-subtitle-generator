@@ -678,6 +678,140 @@ def _is_quota_exhausted(e: urllib.error.HTTPError) -> bool:
     return 'quota' in body.lower() or 'billing' in body.lower() or 'exceeded' in body.lower()
 
 
+def _google_translate_lines(indices, clean_texts, results, log_cb, cancel_check=None):
+    """Translate a list of indices with Google Translate in-place."""
+    if not indices:
+        return
+    log_cb(f"  [Google Translate] {len(indices)} lines…", 'dim')
+    try:
+        from deep_translator import GoogleTranslator
+        gt = GoogleTranslator(source='auto', target='iw')
+        for i in indices:
+            if cancel_check and cancel_check():
+                return
+            try:
+                results[i] = RTL_MARK + gt.translate(clean_texts[i])
+                time.sleep(0.2)
+            except Exception:
+                pass
+    except ImportError:
+        pass
+
+
+def _ai_parallel_translate(raw_texts: list, providers: list,
+                            log_cb, cancel_check=None, progress_cb=None) -> list:
+    """
+    Divide lines evenly across all providers and translate in parallel threads.
+    Quota/failures for a section fall back to Google Translate.
+    """
+    clean_texts = [strip_sub_tags(t) for t in raw_texts]
+    results     = list(raw_texts)
+    total       = len(raw_texts)
+    pending     = [i for i in range(total) if clean_texts[i].strip()]
+
+    # Single gender detection pass using first provider
+    log_cb("  Detecting character genders…", 'dim')
+    gender_block = detect_character_genders(
+        [clean_texts[i] for i in pending], providers[0]['chat_fn'], log_cb)
+    system = HEBREW_SYSTEM_PROMPT.format(gender_block=gender_block)
+
+    # Divide pending indices into equal sections — one per provider
+    n      = len(providers)
+    chunk  = max(1, len(pending) // n)
+    sections = [pending[i * chunk : (i + 1) * chunk] for i in range(n - 1)]
+    sections.append(pending[(n - 1) * chunk:])   # last section gets remainder
+
+    summary = "  | ".join(
+        f"{p['label']}({len(s)} lines)" for p, s in zip(providers, sections) if s)
+    log_cb(f"  Parallel: {summary}", 'dim')
+
+    lock      = threading.Lock()
+    done_ref  = [0]           # mutable int shared across threads
+
+    def translate_section(prov, indices):
+        if not indices:
+            return
+        chat_fn     = prov['chat_fn']
+        batch_size  = prov['batch_size']
+        batch_delay = prov['batch_delay']
+        label       = prov['label']
+        context_win = []
+
+        for b_start in range(0, len(indices), batch_size):
+            if cancel_check and cancel_check():
+                return
+
+            batch_idx   = indices[b_start : b_start + batch_size]
+            batch_texts = [clean_texts[i] for i in batch_idx]
+            batch_num   = b_start // batch_size + 1
+            succeeded   = False
+
+            for attempt in range(4):
+                try:
+                    translated = _ai_translate_batch(batch_texts, chat_fn, system, context_win)
+                    with lock:
+                        for i, heb in zip(batch_idx, translated):
+                            if heb:
+                                results[i] = RTL_MARK + heb
+                                context_win.append(heb)
+                        context_win[:] = context_win[-AI_CONTEXT:]
+                        done_ref[0] += sum(1 for h in translated if h)
+                        if progress_cb:
+                            progress_cb(done_ref[0], total)
+                    succeeded = True
+                    break
+                except urllib.error.HTTPError as e:
+                    if e.code == 429 and _is_quota_exhausted(e):
+                        log_cb(f"  [{label}] quota exhausted → Google Translate for remaining", 'warning')
+                        _google_translate_lines(
+                            indices[b_start:], clean_texts, results, log_cb, cancel_check)
+                        with lock:
+                            done_ref[0] += len(indices[b_start:])
+                            if progress_cb:
+                                progress_cb(done_ref[0], total)
+                        return
+                    elif e.code == 429 and attempt < 3:
+                        wait = 15 * (attempt + 1)
+                        log_cb(f"  [{label}] rate limited, retry {attempt+1}/3 in {wait}s…", 'dim')
+                        time.sleep(wait)
+                    else:
+                        log_cb(f"  [{label}] batch {batch_num} failed ({e})", 'warning')
+                        break
+                except ValueError:
+                    if attempt < 3:
+                        time.sleep(3 * (attempt + 1))
+                    else:
+                        log_cb(f"  [{label}] parse error on batch {batch_num}, skipping", 'warning')
+                        break
+                except Exception as e:
+                    log_cb(f"  [{label}] batch {batch_num} error: {e}", 'warning')
+                    break
+
+            if not succeeded and not cancel_check():
+                # Whole batch failed — Google Translate just this batch
+                _google_translate_lines(batch_idx, clean_texts, results, log_cb, cancel_check)
+                with lock:
+                    done_ref[0] += len(batch_idx)
+                    if progress_cb:
+                        progress_cb(done_ref[0], total)
+
+            time.sleep(batch_delay)
+
+    threads = [
+        threading.Thread(target=translate_section, args=(prov, sec), daemon=True)
+        for prov, sec in zip(providers, sections) if sec
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    if progress_cb:
+        progress_cb(total, total)
+    log_cb(f"  {total}/{total} lines translated", 'dim')
+    return results
+
+
 def _ai_chain_translate(raw_texts: list, providers: list,
                         log_cb, cancel_check=None, progress_cb=None) -> list:
     """
@@ -893,8 +1027,13 @@ def translate_and_save(subs, out_path: str, log_cb,
         })
 
     if providers:
-        log_cb(f"  AI chain: {' → '.join(p['label'] for p in providers)} → Google Translate")
-        translated = _ai_chain_translate(raw_texts, providers, log_cb, cancel_check, progress_cb)
+        if len(providers) >= 2:
+            labels = ' | '.join(p['label'] for p in providers)
+            log_cb(f"  AI parallel: {labels} (+ Google Translate fallback)")
+            translated = _ai_parallel_translate(raw_texts, providers, log_cb, cancel_check, progress_cb)
+        else:
+            log_cb(f"  AI: {providers[0]['label']} → Google Translate")
+            translated = _ai_chain_translate(raw_texts, providers, log_cb, cancel_check, progress_cb)
     else:
         log_cb("  Google Translate (free)")
         try:
@@ -1199,7 +1338,10 @@ class SubtitleApp(_TK_BASE):
             if self.gemini_key:   chain.append("Gemini")
             if self.groq_key:     chain.append("Groq")
             chain.append("Google")
-            options = [f"AI auto-chain ({' → '.join(chain)})"] if has_ai else []
+            n_ai = sum([bool(self.cerebras_key), bool(self.gemini_key), bool(self.groq_key)])
+            mode = "parallel" if n_ai >= 2 else "single"
+            sep  = " | " if n_ai >= 2 else " → "
+            options = [f"AI {mode} ({sep.join(chain)})"] if has_ai else []
             options.append("Google Translate (free)")
             self.trans_combo['values'] = options
             self.trans_combo.current(0)
