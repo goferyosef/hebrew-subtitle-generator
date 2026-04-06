@@ -492,7 +492,8 @@ def _ai_chat(api_url: str, model: str, key: str,
 
 
 def check_cerebras(key: str) -> tuple:
-    """Verify key by listing models — no model name needed."""
+    """List models then probe each with a real chat request to find one that works."""
+    # Step 1: get available model IDs
     try:
         req = urllib.request.Request(
             "https://api.cerebras.ai/v1/models",
@@ -501,18 +502,8 @@ def check_cerebras(key: str) -> tuple:
             method="GET",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            data   = json.loads(resp.read())
-            models = [m["id"] for m in data.get("data", [])]
-        if not models:
-            return False, "No models available for this account."
-        # Pick best model and persist it
-        model = next(
-            (m for m in ("llama-3.3-70b", "gpt-oss-120b", "llama3.1-70b",
-                         "llama3.1-8b") if m in models),
-            models[0]
-        )
-        _save_config({**_load_config(), 'cerebras_model': model})
-        return True, ""
+            data      = json.loads(resp.read())
+            available = [m["id"] for m in data.get("data", [])]
     except urllib.error.HTTPError as e:
         body = ""
         try: body = e.read().decode(errors='replace')[:300]
@@ -520,6 +511,24 @@ def check_cerebras(key: str) -> tuple:
         return False, f"HTTP {e.code} {e.reason}: {body}"
     except Exception as e:
         return False, str(e)
+
+    if not available:
+        return False, "No models returned by /v1/models."
+
+    # Step 2: try each model with an actual chat ping
+    preferred = [m for m in ("llama-3.3-70b", "gpt-oss-120b", "llama3.1-70b",
+                              "llama3.1-8b") if m in available]
+    candidates = preferred + [m for m in available if m not in preferred]
+
+    last_err = f"Tried: {candidates}"
+    for model in candidates:
+        ok, err = _ai_check(CEREBRAS_API_URL, model, key)
+        if ok:
+            _save_config({**_load_config(), 'cerebras_model': model})
+            return True, ""
+        last_err = err
+
+    return False, f"No working model found. Last error: {last_err}"
 
 def cerebras_chat(system: str, user: str, key: str, timeout: int = CEREBRAS_TIMEOUT) -> str:
     model = _load_config().get('cerebras_model', CEREBRAS_MODEL)
