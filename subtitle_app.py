@@ -357,7 +357,7 @@ def ocr_frame(frame, tess_lang: str = 'eng') -> str:
     region = _subtitle_region(frame)
     if region is None:
         return ''
-    best, cfg = '', r'--oem 1 --psm 6 -c tessedit_char_blacklist=|~^_'
+    best, cfg = '', r'--oem 1 --psm 7 -c tessedit_char_blacklist=|~^_'
     for img in preprocess_for_ocr(region):
         try:
             raw     = pytesseract.image_to_string(img, config=cfg, lang=tess_lang)
@@ -1746,7 +1746,7 @@ class SubtitleApp(_TK_BASE):
 
         from concurrent.futures import ThreadPoolExecutor
 
-        OCR_WORKERS = 2
+        OCR_WORKERS = 3
         step_ms     = 1000        # 1 fps — subtitles last ≥ 1 s
         raw_ocr     = []
         ms          = 0
