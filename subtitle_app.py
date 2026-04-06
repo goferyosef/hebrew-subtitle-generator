@@ -618,15 +618,43 @@ def detect_character_genders(sample_texts: list, chat_fn, log_cb) -> str:
 
 
 def _parse_llm_json(response: str, n: int) -> list:
-    m = re.search(r'\[[\s\S]*\]', response)
+    # Strip markdown code fences
+    text = re.sub(r'```(?:json)?\s*|\s*```', '', response).strip()
+
+    # Try JSON array directly
+    m = re.search(r'\[[\s\S]*\]', text)
     if m:
-        parsed = json.loads(m.group())
-        if isinstance(parsed, list) and len(parsed) >= n:
-            return [str(t).strip() for t in parsed[:n]]
-    items = re.findall(r'^\s*\d+\.\s*["\']?(.+?)["\']?\s*$', response, re.MULTILINE)
-    if len(items) >= n:
-        return [t.strip() for t in items[:n]]
-    raise ValueError(f"Could not parse {n} items from response")
+        try:
+            parsed = json.loads(m.group())
+            if isinstance(parsed, list) and parsed:
+                items = [str(t).strip() for t in parsed[:n]]
+                if len(items) >= n:
+                    return items
+                # Partial — pad missing slots with empty string (caller keeps original)
+                return items + [''] * (n - len(items))
+        except json.JSONDecodeError:
+            pass
+
+    # Try JSON object whose first array value contains the translations
+    m = re.search(r'\{[\s\S]*\}', text)
+    if m:
+        try:
+            obj = json.loads(m.group())
+            if isinstance(obj, dict):
+                for v in obj.values():
+                    if isinstance(v, list) and v:
+                        items = [str(t).strip() for t in v[:n]]
+                        return items + [''] * (n - len(items))
+        except json.JSONDecodeError:
+            pass
+
+    # Numbered list: "1. text" or "1) text"
+    items = re.findall(r'^\s*\d+[.)]\s*["\']?(.+?)["\']?\s*$', text, re.MULTILINE)
+    if items:
+        items = [t.strip() for t in items[:n]]
+        return items + [''] * (n - len(items))
+
+    raise ValueError(f"Could not parse response (got {len(text)} chars)")
 
 
 def _ai_translate_batch(texts: list, chat_fn, system: str, context_window: list) -> list:
@@ -696,9 +724,10 @@ def _ai_chain_translate(raw_texts: list, providers: list,
                 try:
                     translated = _ai_translate_batch(batch_texts, chat_fn, system, context_window)
                     for i, heb in zip(batch_idx, translated):
-                        results[i]         = RTL_MARK + heb
-                        translated_mask[i] = True
-                        context_window.append(heb)
+                        if heb:  # empty string = parser returned partial; skip slot
+                            results[i]         = RTL_MARK + heb
+                            translated_mask[i] = True
+                            context_window.append(heb)
                     context_window = context_window[-AI_CONTEXT:]
                     break
                 except urllib.error.HTTPError as e:
