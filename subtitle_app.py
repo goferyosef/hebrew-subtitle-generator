@@ -1077,9 +1077,11 @@ class SubtitleApp(_TK_BASE):
     # ── Timer ──────────────────────────────────────────────────────────────────
 
     def _start_timer(self):
-        self._job_start = time.time()
-        self._job_done  = 0
-        self._job_total = 0
+        self._job_start      = time.time()
+        self._eta_start      = None   # set when first line is translated
+        self._eta_done_base  = 0      # _job_done value at _eta_start
+        self._job_done       = 0
+        self._job_total      = 0
         self.time_var.set("")
         self._tick_timer()
 
@@ -1089,8 +1091,13 @@ class SubtitleApp(_TK_BASE):
         elapsed = time.time() - self._job_start
         eta_str = "--:--"
         if self._job_total > 0 and self._job_done > 0:
-            rate = self._job_done / elapsed
-            eta_str = _fmt_time(int((self._job_total - self._job_done) / rate))
+            # ETA rate based on translation-only time (excludes gender detection etc.)
+            xlat_elapsed = time.time() - self._eta_start
+            xlat_done    = self._job_done - self._eta_done_base
+            if xlat_elapsed > 0 and xlat_done > 0:
+                rate    = xlat_done / xlat_elapsed
+                remaining = self._job_total - self._job_done
+                eta_str = _fmt_time(int(remaining / rate))
         self.time_var.set(f"Elapsed: {_fmt_time(int(elapsed))}  ETA: {eta_str}")
         self._timer_id = self.after(1000, self._tick_timer)
 
@@ -1105,6 +1112,9 @@ class SubtitleApp(_TK_BASE):
 
     def set_job_progress(self, done: int, total: int):
         """Called from worker thread — safe to set plain ints."""
+        if done > 0 and self._eta_start is None:
+            self._eta_start     = time.time()
+            self._eta_done_base = 0
         self._job_done  = done
         self._job_total = total
 
