@@ -27,6 +27,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -131,6 +132,17 @@ GROQ_MODEL       = "llama-3.3-70b-versatile"
 GROQ_BATCH_SIZE  = 10
 GROQ_BATCH_DELAY = 2.0
 GROQ_TIMEOUT     = 60
+
+# Mistral (free tier — https://console.mistral.ai)
+MISTRAL_API_URL   = "https://api.mistral.ai/v1/chat/completions"
+MISTRAL_MODEL     = "mistral-small-latest"
+MISTRAL_BATCH_SIZE  = 15
+MISTRAL_BATCH_DELAY = 1.0
+MISTRAL_TIMEOUT     = 60
+
+# DeepL (free tier — https://www.deepl.com/pro-api, 500K chars/month)
+DEEPL_API_URL_FREE = "https://api-free.deepl.com/v2/translate"
+DEEPL_API_URL_PAID = "https://api.deepl.com/v2/translate"
 
 AI_CONTEXT = 20   # lines of prior context kept for gender consistency
 
@@ -486,6 +498,22 @@ def save_groq_key(key: str):
     data['groq_api_key'] = key.strip()
     _save_config(data)
 
+def load_mistral_key() -> str:
+    return _load_config().get('mistral_api_key', '')
+
+def save_mistral_key(key: str):
+    data = _load_config()
+    data['mistral_api_key'] = key.strip()
+    _save_config(data)
+
+def load_deepl_key() -> str:
+    return _load_config().get('deepl_api_key', '')
+
+def save_deepl_key(key: str):
+    data = _load_config()
+    data['deepl_api_key'] = key.strip()
+    _save_config(data)
+
 def _ai_check(api_url: str, model: str, key: str) -> tuple:
     """Ping an OpenAI-compatible endpoint. Returns (ok, error_msg)."""
     if not key:
@@ -630,6 +658,60 @@ def gemini_chat(system: str, user: str, key: str, timeout: int = GEMINI_TIMEOUT)
         return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
+def check_mistral(key: str) -> tuple:
+    return _ai_check(MISTRAL_API_URL, MISTRAL_MODEL, key)
+
+def mistral_chat(system: str, user: str, key: str, timeout: int = MISTRAL_TIMEOUT) -> str:
+    return _ai_chat(MISTRAL_API_URL, MISTRAL_MODEL, key, system, user, timeout)
+
+
+def check_deepl(key: str) -> tuple:
+    """Ping DeepL API. Returns (ok, error_msg)."""
+    if not key:
+        return False, "No key provided."
+    url = DEEPL_API_URL_FREE if key.endswith(':fx') else DEEPL_API_URL_PAID
+    try:
+        payload = urllib.parse.urlencode({
+            'auth_key': key, 'text': 'hello', 'target_lang': 'HE'
+        }).encode()
+        req = urllib.request.Request(url, data=payload,
+                                     headers={"Content-Type": "application/x-www-form-urlencoded"},
+                                     method="POST")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status == 200, ""
+    except urllib.error.HTTPError as e:
+        body = ""
+        try: body = e.read().decode(errors='replace')[:300]
+        except Exception: pass
+        return False, f"HTTP {e.code}: {body}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _deepl_translate_lines(indices, clean_texts, results, log_cb, key: str, cancel_check=None):
+    """Translate a list of indices with DeepL in-place."""
+    if not indices or not key:
+        return
+    url = DEEPL_API_URL_FREE if key.endswith(':fx') else DEEPL_API_URL_PAID
+    log_cb(f"  [DeepL] {len(indices)} lines…", 'dim')
+    for i in indices:
+        if cancel_check and cancel_check():
+            return
+        try:
+            payload = urllib.parse.urlencode({
+                'auth_key': key, 'text': clean_texts[i], 'target_lang': 'HE'
+            }).encode()
+            req = urllib.request.Request(url, data=payload,
+                                         headers={"Content-Type": "application/x-www-form-urlencoded"},
+                                         method="POST")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+                results[i] = RTL_MARK + data['translations'][0]['text']
+            time.sleep(0.15)
+        except Exception:
+            pass
+
+
 def detect_character_genders(sample_texts: list, chat_fn, log_cb) -> str:
     if not sample_texts:
         return ""
@@ -737,9 +819,13 @@ def _is_quota_exhausted(e: urllib.error.HTTPError) -> bool:
     return 'quota' in body.lower() or 'billing' in body.lower() or 'exceeded' in body.lower()
 
 
-def _google_translate_lines(indices, clean_texts, results, log_cb, cancel_check=None):
-    """Translate a list of indices with Google Translate in-place."""
+def _google_translate_lines(indices, clean_texts, results, log_cb, cancel_check=None,
+                            deepl_key: str = ''):
+    """Translate with DeepL if key available, otherwise Google Translate."""
     if not indices:
+        return
+    if deepl_key:
+        _deepl_translate_lines(indices, clean_texts, results, log_cb, deepl_key, cancel_check)
         return
     log_cb(f"  [Google Translate] {len(indices)} lines…", 'dim')
     try:
@@ -758,10 +844,11 @@ def _google_translate_lines(indices, clean_texts, results, log_cb, cancel_check=
 
 
 def _ai_parallel_translate(raw_texts: list, providers: list,
-                            log_cb, cancel_check=None, progress_cb=None) -> list:
+                            log_cb, cancel_check=None, progress_cb=None,
+                            deepl_key: str = '') -> list:
     """
     Divide lines evenly across all providers and translate in parallel threads.
-    Quota/failures for a section fall back to Google Translate.
+    Quota/failures for a section fall back to DeepL (if key set) or Google Translate.
     """
     clean_texts = [strip_sub_tags(t) for t in raw_texts]
     results     = list(raw_texts)
@@ -821,9 +908,11 @@ def _ai_parallel_translate(raw_texts: list, providers: list,
                     break
                 except urllib.error.HTTPError as e:
                     if e.code == 429 and _is_quota_exhausted(e):
-                        log_cb(f"  [{label}] quota exhausted → Google Translate for remaining", 'warning')
+                        fb = "DeepL" if deepl_key else "Google Translate"
+                        log_cb(f"  [{label}] quota exhausted → {fb} for remaining", 'warning')
                         _google_translate_lines(
-                            indices[b_start:], clean_texts, results, log_cb, cancel_check)
+                            indices[b_start:], clean_texts, results, log_cb, cancel_check,
+                            deepl_key=deepl_key)
                         with lock:
                             done_ref[0] += len(indices[b_start:])
                             if progress_cb:
@@ -847,8 +936,8 @@ def _ai_parallel_translate(raw_texts: list, providers: list,
                     break
 
             if not succeeded and not cancel_check():
-                # Whole batch failed — Google Translate just this batch
-                _google_translate_lines(batch_idx, clean_texts, results, log_cb, cancel_check)
+                _google_translate_lines(batch_idx, clean_texts, results, log_cb, cancel_check,
+                                        deepl_key=deepl_key)
                 with lock:
                     done_ref[0] += len(batch_idx)
                     if progress_cb:
@@ -872,12 +961,13 @@ def _ai_parallel_translate(raw_texts: list, providers: list,
 
 
 def _ai_chain_translate(raw_texts: list, providers: list,
-                        log_cb, cancel_check=None, progress_cb=None) -> list:
+                        log_cb, cancel_check=None, progress_cb=None,
+                        deepl_key: str = '') -> list:
     """
     Translate using a chain of AI providers.
     providers: [{'label', 'chat_fn', 'batch_size', 'batch_delay'}, ...]
     Each provider picks up untranslated lines where the previous left off.
-    Falls back to Google Translate if all AI providers are exhausted.
+    Falls back to DeepL (if key set) or Google Translate if all providers exhausted.
     """
     clean_texts     = [strip_sub_tags(t) for t in raw_texts]
     results         = list(raw_texts)
@@ -896,7 +986,7 @@ def _ai_chain_translate(raw_texts: list, providers: list,
         if not pending:
             break
 
-        next_label = providers[pi + 1]['label'] if pi + 1 < len(providers) else "Google Translate"
+        next_label = providers[pi + 1]['label'] if pi + 1 < len(providers) else ("DeepL" if deepl_key else "Google Translate")
 
         log_cb(f"  [{label}] Detecting character genders…", 'dim')
         gender_block   = detect_character_genders([clean_texts[i] for i in pending], chat_fn, log_cb)
@@ -958,22 +1048,12 @@ def _ai_chain_translate(raw_texts: list, providers: list,
         if not quota_hit:
             break   # This provider finished everything
 
-    # Any lines still untranslated → Google Translate
+    # Any lines still untranslated → DeepL or Google Translate
     remaining = [i for i, done in enumerate(translated_mask)
                  if not done and clean_texts[i].strip()]
     if remaining:
-        log_cb(f"  [Google Translate] {len(remaining)} lines remaining…", 'dim')
-        try:
-            from deep_translator import GoogleTranslator
-            gt = GoogleTranslator(source='auto', target='iw')
-            for i in remaining:
-                try:
-                    results[i] = RTL_MARK + gt.translate(clean_texts[i])
-                    time.sleep(0.2)
-                except Exception:
-                    pass
-        except ImportError:
-            pass
+        _google_translate_lines(remaining, clean_texts, results, log_cb, cancel_check,
+                                deepl_key=deepl_key)
 
     done = sum(translated_mask) + len([i for i in remaining if results[i] != raw_texts[i]])
     log_cb(f"  {total}/{total} lines translated", 'dim')
@@ -1046,7 +1126,8 @@ def _google_batch_translate(texts: list, log_cb, cancel_check=None, progress_cb=
 
 def translate_and_save(subs, out_path: str, log_cb,
                        cerebras_key: str = None, gemini_key: str = None,
-                       groq_key: str = None,
+                       groq_key: str = None, mistral_key: str = None,
+                       deepl_key: str = None,
                        cancel_check=None, progress_cb=None):
     import pysubs2
 
@@ -1084,22 +1165,39 @@ def translate_and_save(subs, out_path: str, log_cb,
             'batch_size':  GROQ_BATCH_SIZE,
             'batch_delay': GROQ_BATCH_DELAY,
         })
+    if mistral_key:
+        providers.append({
+            'label':       'Mistral',
+            'chat_fn':     lambda sys, usr: mistral_chat(sys, usr, mistral_key),
+            'batch_size':  MISTRAL_BATCH_SIZE,
+            'batch_delay': MISTRAL_BATCH_DELAY,
+        })
 
     if providers:
+        fallback_label = "DeepL" if deepl_key else "Google Translate"
         if len(providers) >= 2:
             labels = ' | '.join(p['label'] for p in providers)
-            log_cb(f"  AI parallel: {labels} (+ Google Translate fallback)")
-            translated = _ai_parallel_translate(raw_texts, providers, log_cb, cancel_check, progress_cb)
+            log_cb(f"  AI parallel: {labels} (+ {fallback_label} fallback)")
+            translated = _ai_parallel_translate(raw_texts, providers, log_cb, cancel_check,
+                                                progress_cb, deepl_key=deepl_key)
         else:
-            log_cb(f"  AI: {providers[0]['label']} → Google Translate")
-            translated = _ai_chain_translate(raw_texts, providers, log_cb, cancel_check, progress_cb)
+            log_cb(f"  AI: {providers[0]['label']} → {fallback_label}")
+            translated = _ai_chain_translate(raw_texts, providers, log_cb, cancel_check,
+                                             progress_cb, deepl_key=deepl_key)
     else:
-        log_cb("  Google Translate (free)")
-        try:
-            translated = _google_batch_translate(raw_texts, log_cb, cancel_check, progress_cb)
-        except ImportError:
-            log_cb("deep-translator not installed — pip install deep-translator", 'error')
-            return
+        if deepl_key:
+            log_cb("  DeepL (free tier)")
+            clean_texts = [strip_sub_tags(t) for t in raw_texts]
+            translated  = list(raw_texts)
+            _deepl_translate_lines(list(range(len(raw_texts))), clean_texts, translated,
+                                   log_cb, deepl_key, cancel_check)
+        else:
+            log_cb("  Google Translate (free)")
+            try:
+                translated = _google_batch_translate(raw_texts, log_cb, cancel_check, progress_cb)
+            except ImportError:
+                log_cb("deep-translator not installed — pip install deep-translator", 'error')
+                return
 
     t_map  = {i: t for (i, _), t in zip(with_text, translated)}
     result = pysubs2.SSAFile()
@@ -1125,6 +1223,8 @@ class SubtitleApp(_TK_BASE):
         self.cerebras_key  = load_cerebras_key()
         self.gemini_key    = load_gemini_key()
         self.groq_key      = load_groq_key()
+        self.mistral_key   = load_mistral_key()
+        self.deepl_key     = load_deepl_key()
         self._cancel_event = threading.Event()
         self._job_start    = None
         self._job_done     = 0
@@ -1175,6 +1275,15 @@ class SubtitleApp(_TK_BASE):
         self.cerebras_btn = ttk.Button(top, text="⚡ Cerebras Key",
                                        command=self._set_cerebras_key, width=15)
         self.cerebras_btn.grid(row=1, column=5, padx=(0, 6))
+
+        # Row 2: Mistral + DeepL keys
+        self.mistral_btn = ttk.Button(top, text="🌟 Mistral Key",
+                                      command=self._set_mistral_key, width=14)
+        self.mistral_btn.grid(row=2, column=3, padx=(0, 4), pady=(4, 0))
+
+        self.deepl_btn = ttk.Button(top, text="🌍 DeepL Key",
+                                    command=self._set_deepl_key, width=13)
+        self.deepl_btn.grid(row=2, column=4, padx=(0, 4), pady=(4, 0))
 
         # File label (stretchy)
         self.file_var = tk.StringVar(value="No file selected")
@@ -1428,38 +1537,75 @@ class SubtitleApp(_TK_BASE):
                 self.log(f"  ✗ Groq key invalid: {err}", 'warning')
                 self.groq_key = ''
 
-        if not self.cerebras_key and not self.gemini_key and not self.groq_key:
-            self.log("  No AI key set — will use Google Translate", 'warning')
+        # Mistral
+        self.log("Checking Mistral API key…", 'dim')
+        if self.mistral_key:
+            ok, err = check_mistral(self.mistral_key)
+            if ok:
+                self.log(f"  ✓ Mistral ready ({MISTRAL_MODEL})", 'success')
+            else:
+                self.log(f"  ✗ Mistral key invalid: {err}", 'warning')
+                self.mistral_key = ''
+        else:
+            self.log("  No Mistral key — click '🌟 Mistral Key' (free tier available)", 'dim')
+            self.log("  Get a free key at: https://console.mistral.ai", 'dim')
+
+        # DeepL
+        self.log("Checking DeepL API key…", 'dim')
+        if self.deepl_key:
+            ok, err = check_deepl(self.deepl_key)
+            if ok:
+                tier = "free" if self.deepl_key.endswith(':fx') else "paid"
+                self.log(f"  ✓ DeepL ready ({tier} tier)", 'success')
+            else:
+                self.log(f"  ✗ DeepL key invalid: {err}", 'warning')
+                self.deepl_key = ''
+        else:
+            self.log("  No DeepL key — click '🌍 DeepL Key' (500K chars/month free)", 'dim')
+            self.log("  Get a free key at: https://www.deepl.com/pro-api", 'dim')
+
+        if not any([self.cerebras_key, self.gemini_key, self.groq_key, self.mistral_key]):
+            self.log("  No AI key set — will use DeepL or Google Translate", 'warning')
 
         self._update_translator_options()
         self.log("Ready.", 'success')
 
     def _update_translator_options(self):
         def _do():
-            has_ai = bool(self.cerebras_key or self.gemini_key or self.groq_key)
+            has_ai = bool(self.cerebras_key or self.gemini_key or self.groq_key or self.mistral_key)
             chain  = []
             if self.cerebras_key: chain.append("Cerebras")
             if self.gemini_key:   chain.append("Gemini")
             if self.groq_key:     chain.append("Groq")
-            chain.append("Google")
-            n_ai = sum([bool(self.cerebras_key), bool(self.gemini_key), bool(self.groq_key)])
+            if self.mistral_key:  chain.append("Mistral")
+            chain.append("DeepL" if self.deepl_key else "Google")
+            n_ai = sum([bool(self.cerebras_key), bool(self.gemini_key),
+                        bool(self.groq_key), bool(self.mistral_key)])
             mode = "parallel" if n_ai >= 2 else "single"
             sep  = " | " if n_ai >= 2 else " → "
             options = [f"AI {mode} ({sep.join(chain)})"] if has_ai else []
+            if self.deepl_key:
+                options.append("DeepL (free tier)")
             options.append("Google Translate (free)")
             self.trans_combo['values'] = options
             self.trans_combo.current(0)
         self.after(0, _do)
 
     def _ai_keys(self) -> dict:
-        """Return AI keys only when AI mode is selected."""
+        """Return AI + DeepL keys only when AI mode is selected."""
         if self.translator_var.get().startswith("AI"):
             return {
                 'cerebras_key': self.cerebras_key,
                 'gemini_key':   self.gemini_key,
                 'groq_key':     self.groq_key,
+                'mistral_key':  self.mistral_key,
+                'deepl_key':    self.deepl_key,
             }
-        return {'cerebras_key': '', 'gemini_key': '', 'groq_key': ''}
+        if self.translator_var.get().startswith("DeepL"):
+            return {'cerebras_key': '', 'gemini_key': '', 'groq_key': '',
+                    'mistral_key': '', 'deepl_key': self.deepl_key}
+        return {'cerebras_key': '', 'gemini_key': '', 'groq_key': '',
+                'mistral_key': '', 'deepl_key': ''}
 
     def _set_groq_key(self):
         """Dialog to enter/update the Groq API key."""
@@ -1590,6 +1736,91 @@ class SubtitleApp(_TK_BASE):
                 self.log(f"  ✗ Cerebras verification failed: {err}", 'warning')
                 messagebox.showerror("Invalid key",
                     f"Could not connect to Cerebras with this key.\n\nError: {err}", parent=dlg)
+
+        bf = ttk.Frame(dlg)
+        bf.grid(row=3, column=0, columnspan=2, pady=(0, 12))
+        ttk.Button(bf, text="Save & Verify", command=_save).pack(side='left', padx=6)
+        ttk.Button(bf, text="Cancel", command=dlg.destroy).pack(side='left', padx=6)
+        entry.focus_set()
+        dlg.bind("<Return>", lambda _: _save())
+
+    def _set_mistral_key(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("Mistral API Key")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="Enter your Mistral API key:").grid(
+            row=0, column=0, columnspan=2, padx=16, pady=(14, 4), sticky='w')
+        ttk.Label(dlg, text="Get a free key at https://console.mistral.ai",
+                  foreground='#555').grid(
+            row=1, column=0, columnspan=2, padx=16, pady=(0, 8), sticky='w')
+
+        entry = ttk.Entry(dlg, width=52, show='')
+        entry.grid(row=2, column=0, columnspan=2, padx=16, pady=(0, 12))
+        if self.mistral_key:
+            entry.insert(0, self.mistral_key)
+
+        def _save():
+            key = entry.get().strip()
+            if not key:
+                messagebox.showwarning("Empty key", "Please enter a key.", parent=dlg)
+                return
+            self.log("Verifying Mistral key…", 'dim')
+            ok, err = check_mistral(key)
+            if ok:
+                self.mistral_key = key
+                save_mistral_key(key)
+                self.log(f"✓ Mistral key saved ({MISTRAL_MODEL} ready)", 'success')
+                self._update_translator_options()
+                dlg.destroy()
+            else:
+                self.log(f"  ✗ Mistral verification failed: {err}", 'warning')
+                messagebox.showerror("Invalid key",
+                    f"Could not connect to Mistral with this key.\n\nError: {err}", parent=dlg)
+
+        bf = ttk.Frame(dlg)
+        bf.grid(row=3, column=0, columnspan=2, pady=(0, 12))
+        ttk.Button(bf, text="Save & Verify", command=_save).pack(side='left', padx=6)
+        ttk.Button(bf, text="Cancel", command=dlg.destroy).pack(side='left', padx=6)
+        entry.focus_set()
+        dlg.bind("<Return>", lambda _: _save())
+
+    def _set_deepl_key(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("DeepL API Key")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="Enter your DeepL API key (free tier ends with :fx):").grid(
+            row=0, column=0, columnspan=2, padx=16, pady=(14, 4), sticky='w')
+        ttk.Label(dlg, text="Get a free key at https://www.deepl.com/pro-api",
+                  foreground='#555').grid(
+            row=1, column=0, columnspan=2, padx=16, pady=(0, 8), sticky='w')
+
+        entry = ttk.Entry(dlg, width=52, show='')
+        entry.grid(row=2, column=0, columnspan=2, padx=16, pady=(0, 12))
+        if self.deepl_key:
+            entry.insert(0, self.deepl_key)
+
+        def _save():
+            key = entry.get().strip()
+            if not key:
+                messagebox.showwarning("Empty key", "Please enter a key.", parent=dlg)
+                return
+            self.log("Verifying DeepL key…", 'dim')
+            ok, err = check_deepl(key)
+            if ok:
+                self.deepl_key = key
+                save_deepl_key(key)
+                tier = "free" if key.endswith(':fx') else "paid"
+                self.log(f"✓ DeepL key saved ({tier} tier)", 'success')
+                self._update_translator_options()
+                dlg.destroy()
+            else:
+                self.log(f"  ✗ DeepL verification failed: {err}", 'warning')
+                messagebox.showerror("Invalid key",
+                    f"Could not connect to DeepL with this key.\n\nError: {err}", parent=dlg)
 
         bf = ttk.Frame(dlg)
         bf.grid(row=3, column=0, columnspan=2, pady=(0, 12))
