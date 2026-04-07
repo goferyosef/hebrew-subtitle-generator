@@ -365,44 +365,70 @@ def _region_thumb_hash(frame, crop_pct: float = 0.20) -> str | None:
     return hashlib.md5(mask.tobytes()).hexdigest()
 
 
+def _ocr_score(text: str) -> float:
+    """
+    Score OCR output quality: 0.0 = gibberish, 1.0 = clean text.
+    Penalises symbol noise and rewards word-like tokens.
+    Returns -1.0 to reject outright.
+    """
+    if not text or len(text) < 3:
+        return -1.0
+    # Reject if more than 20% non-text characters
+    sym = sum(1 for c in text if not (c.isalpha() or c in " ,.!?'-–—:;\"()")) / len(text)
+    if sym > 0.20:
+        return -1.0
+    # Must contain at least one word of 2+ alpha chars
+    words = re.findall(r'[A-Za-z\u0590-\u05FF]{2,}', text)
+    if not words:
+        return -1.0
+    # Score = word coverage (alpha chars / total non-space chars)
+    alpha = sum(len(w) for w in words)
+    total = max(len(text.replace(' ', '')), 1)
+    return alpha / total
+
+
 def ocr_frame(frame, tess_lang: str = 'eng', crop_pct: float = 0.20) -> str:
     import pytesseract
     region = _subtitle_region(frame, crop_pct)
     if region is None:
         return ''
-    best, cfg = '', r'--oem 1 --psm 6 -c tessedit_char_blacklist=|~^_'
+    cfg  = r'--oem 1 --psm 6 -c tessedit_char_blacklist=|~^_\/'
+    best_text, best_score = '', -1.0
     for img in preprocess_for_ocr(region):
         try:
             raw     = pytesseract.image_to_string(img, config=cfg, lang=tess_lang)
             cleaned = ' '.join(raw.split())
-            if len(cleaned) < 3:
-                continue
-            sym = sum(1 for c in cleaned
-                      if not (c.isalpha() or c in " ,.!?'-–—")) / max(len(cleaned), 1)
-            if sym > 0.4:
-                continue
-            if len(cleaned) > len(best):
-                best = cleaned
-                if len(best) >= 8:   # Good enough — skip remaining variants
+            score   = _ocr_score(cleaned)
+            if score > best_score:
+                best_score = score
+                best_text  = cleaned
+                if best_score >= 0.85:   # High confidence — stop early
                     break
         except Exception:
             continue
-    return best
+    return best_text if best_score >= 0.0 else ''
 
 
 def deduplicate_ocr_lines(raw: list) -> list:
+    if not raw:
+        return []
+    # Pre-filter: drop entries that don't contain at least one real word
+    raw = [(ms, t) for ms, t in raw if re.search(r'[A-Za-z\u0590-\u05FF]{3,}', t)]
     if not raw:
         return []
     lines, cur_text, cur_start, cur_last = [], raw[0][1], raw[0][0], raw[0][0]
     for ms, text in raw[1:]:
         similar = difflib.SequenceMatcher(None, cur_text, text).ratio() > 0.80
         if similar and ms - cur_last <= 2000:
+            # Keep the longer/better of the two versions
+            if len(text) > len(cur_text):
+                cur_text = text
             cur_last = ms
         else:
-            if cur_last - cur_start >= 400 and len(cur_text.strip()) >= 3:
+            if cur_last - cur_start >= 400:
                 lines.append(OcrLine(cur_text, cur_start, cur_last + 800))
             cur_text, cur_start, cur_last = text, ms, ms
-    if cur_last - cur_start >= 400 and len(cur_text.strip()) >= 3:
+    if cur_last - cur_start >= 400:
         lines.append(OcrLine(cur_text, cur_start, cur_last + 800))
     return lines
 
