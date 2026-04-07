@@ -114,7 +114,7 @@ AI_CONFIG_PATH = Path.home() / ".hebrew_subtitle_config.json"
 # Cerebras (fastest inference — https://cloud.cerebras.ai)
 CEREBRAS_API_URL   = "https://api.cerebras.ai/v1/chat/completions"
 CEREBRAS_MODEL     = "gpt-oss-120b"
-CEREBRAS_BATCH_SIZE  = 15
+CEREBRAS_BATCH_SIZE  = 10
 CEREBRAS_BATCH_DELAY = 0.5   # wafer-scale chips — very fast, minimal delay needed
 CEREBRAS_TIMEOUT     = 60
 
@@ -670,21 +670,27 @@ def _parse_llm_json(response: str, n: int) -> list:
     # Strip markdown code fences
     text = re.sub(r'```(?:json)?\s*|\s*```', '', response).strip()
 
-    # Try JSON array directly
-    m = re.search(r'\[[\s\S]*\]', text)
+    def _pad(items):
+        return (items + [''] * n)[:n]
+
+    # 1. JSON array directly
+    m = re.search(r'\[[\s\S]*?\]', text)
     if m:
         try:
             parsed = json.loads(m.group())
             if isinstance(parsed, list) and parsed:
-                items = [str(t).strip() for t in parsed[:n]]
-                if len(items) >= n:
-                    return items
-                # Partial — pad missing slots with empty string (caller keeps original)
-                return items + [''] * (n - len(items))
+                return _pad([str(t).strip() for t in parsed])
         except json.JSONDecodeError:
             pass
 
-    # Try JSON object whose first array value contains the translations
+    # 2. Partial / truncated JSON array — extract all quoted strings inside [...]
+    m = re.search(r'\[[\s\S]*', text)
+    if m:
+        strings = re.findall(r'"((?:[^"\\]|\\.)*)"', m.group())
+        if len(strings) >= max(1, n // 2):
+            return _pad([s.strip() for s in strings])
+
+    # 3. JSON object whose value is an array
     m = re.search(r'\{[\s\S]*\}', text)
     if m:
         try:
@@ -692,16 +698,20 @@ def _parse_llm_json(response: str, n: int) -> list:
             if isinstance(obj, dict):
                 for v in obj.values():
                     if isinstance(v, list) and v:
-                        items = [str(t).strip() for t in v[:n]]
-                        return items + [''] * (n - len(items))
+                        return _pad([str(t).strip() for t in v])
         except json.JSONDecodeError:
             pass
 
-    # Numbered list: "1. text" or "1) text"
+    # 4. Numbered list: "1. text" or "1) text"
     items = re.findall(r'^\s*\d+[.)]\s*["\']?(.+?)["\']?\s*$', text, re.MULTILINE)
     if items:
-        items = [t.strip() for t in items[:n]]
-        return items + [''] * (n - len(items))
+        return _pad([t.strip() for t in items])
+
+    # 5. Hebrew-line fallback — grab any line that contains Hebrew characters
+    heb_lines = [ln.strip() for ln in text.splitlines()
+                 if re.search(r'[\u0590-\u05FF]', ln) and len(ln.strip()) > 1]
+    if heb_lines:
+        return _pad(heb_lines)
 
     raise ValueError(f"Could not parse response (got {len(text)} chars)")
 
