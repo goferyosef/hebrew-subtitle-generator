@@ -321,11 +321,11 @@ def preprocess_for_ocr(region):
     return [t1, t2, t3, yellow]
 
 
-def _subtitle_region(frame):
-    """Crop bottom 20% (subtitle zone), resize to max 960px wide, upscale 2x."""
+def _subtitle_region(frame, crop_pct: float = 0.20):
+    """Crop bottom crop_pct of frame (subtitle zone), resize to max 960px wide, upscale 2x."""
     import cv2
     h, w   = frame.shape[:2]
-    region = frame[int(h * 0.80):, :]
+    region = frame[int(h * (1.0 - crop_pct)):, :]
     if region.size == 0:
         return None
     rh, rw = region.shape[:2]
@@ -336,14 +336,14 @@ def _subtitle_region(frame):
     return cv2.resize(region, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
 
 
-def _region_thumb_hash(frame) -> str | None:
+def _region_thumb_hash(frame, crop_pct: float = 0.20) -> str | None:
     """
     Hash only the thresholded text pixels in the subtitle zone.
     Scene/background changes don't affect the result — only actual text changes do.
     """
     import cv2
     h, w   = frame.shape[:2]
-    region = frame[int(h * 0.80):, :]
+    region = frame[int(h * (1.0 - crop_pct)):, :]
     if region.size == 0:
         return None
     gray  = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
@@ -352,9 +352,9 @@ def _region_thumb_hash(frame) -> str | None:
     return hashlib.md5(mask.tobytes()).hexdigest()
 
 
-def ocr_frame(frame, tess_lang: str = 'eng') -> str:
+def ocr_frame(frame, tess_lang: str = 'eng', crop_pct: float = 0.20) -> str:
     import pytesseract
-    region = _subtitle_region(frame)
+    region = _subtitle_region(frame, crop_pct)
     if region is None:
         return ''
     best, cfg = '', r'--oem 1 --psm 7 -c tessedit_char_blacklist=|~^_'
@@ -1147,6 +1147,22 @@ class SubtitleApp(_TK_BASE):
                 row=2, column=0, columnspan=7, sticky='w', pady=(4, 0)
             )
 
+        # ── OCR crop zone slider ──
+        self.ocr_crop_var = tk.IntVar(value=20)
+        ttk.Label(top, text="OCR crop zone:",
+                  font=('Segoe UI', 8)).grid(row=3, column=0, sticky='e', padx=(0, 4), pady=(4, 0))
+        crop_slider = ttk.Scale(top, from_=10, to=50, orient='horizontal',
+                                variable=self.ocr_crop_var, length=130)
+        crop_slider.grid(row=3, column=1, columnspan=2, sticky='w', pady=(4, 0))
+        self.ocr_crop_lbl = ttk.Label(top, text="20% of frame height",
+                                      font=('Segoe UI', 8), foreground='#666')
+        self.ocr_crop_lbl.grid(row=3, column=3, sticky='w', padx=(4, 0), pady=(4, 0))
+
+        def _update_crop_label(*_):
+            v = self.ocr_crop_var.get()
+            self.ocr_crop_lbl.config(text=f"{v}% of frame height")
+        self.ocr_crop_var.trace_add('write', _update_crop_label)
+
         # ── Log area ──
         mid = ttk.LabelFrame(self, text="Log", padding=(8, 4))
         mid.grid(row=1, column=0, sticky='nsew', padx=12, pady=4)
@@ -1740,8 +1756,9 @@ class SubtitleApp(_TK_BASE):
         dur_str     = f"{duration_ms // 60000}m {(duration_ms % 60000) // 1000}s"
 
         tess_lang = _tess_lang()
+        crop_pct  = self.ocr_crop_var.get() / 100.0
         self.log(f"Video: {dur_str}  ({total_f:,} frames @ {fps:.1f} fps)")
-        self.log(f"OCR language(s): {tess_lang}", 'dim')
+        self.log(f"OCR language(s): {tess_lang}  |  crop zone: bottom {self.ocr_crop_var.get()}%", 'dim')
         self.log("Scanning at 1 fps — text-aware change detection + 2 parallel OCR workers…", 'warning')
 
         from concurrent.futures import ThreadPoolExecutor
@@ -1779,7 +1796,7 @@ class SubtitleApp(_TK_BASE):
                 if not ret:
                     break
 
-                curr_hash = _region_thumb_hash(frame)
+                curr_hash = _region_thumb_hash(frame, crop_pct)
                 if curr_hash is not None and curr_hash == prev_hash:
                     skipped += 1
                     ms += step_ms
@@ -1788,7 +1805,7 @@ class SubtitleApp(_TK_BASE):
 
                 # Submit to thread pool; limit queue depth to avoid memory bloat
                 _flush_pending(block_until=OCR_WORKERS * 3)
-                pending.append((ms, pool.submit(ocr_frame, frame.copy(), tess_lang)))
+                pending.append((ms, pool.submit(ocr_frame, frame.copy(), tess_lang, crop_pct)))
                 ocr_calls += 1
 
                 self.set_job_progress(ms, duration_ms)
@@ -1829,11 +1846,6 @@ class SubtitleApp(_TK_BASE):
                            progress_cb=self.set_job_progress)
         if not self._should_cancel():
             self.log(f"Done! → {out}", 'success')
-            try:
-                Path(raw_path).unlink()
-                self.log(f"Deleted: {Path(raw_path).name}", 'dim')
-            except Exception:
-                pass
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
