@@ -1089,6 +1089,7 @@ class SubtitleApp(_TK_BASE):
     def _build_widgets(self):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
+        self.rowconfigure(2, weight=0)   # OCR QA panel — fixed height
 
         # ── Top bar ──
         top = ttk.Frame(self, padding=(12, 10, 12, 4))
@@ -1189,9 +1190,21 @@ class SubtitleApp(_TK_BASE):
             self.log_text.drop_target_register(DND_FILES)
             self.log_text.dnd_bind('<<Drop>>', self._on_drop)
 
+        # ── OCR QA panel ──
+        qa_frame = ttk.LabelFrame(self, text="OCR Preview  (live)", padding=(8, 4))
+        qa_frame.grid(row=2, column=0, sticky='ew', padx=12, pady=(0, 4))
+        qa_frame.columnconfigure(0, weight=1)
+
+        self.ocr_qa_text = tk.Text(
+            qa_frame, state=tk.DISABLED, wrap=tk.WORD, height=3,
+            font=('Consolas', 9), bg='#111', fg='#c8e6c9',
+            relief='flat',
+        )
+        self.ocr_qa_text.grid(row=0, column=0, sticky='ew')
+
         # ── Bottom bar ──
         bot = ttk.Frame(self, padding=(12, 4, 12, 8))
-        bot.grid(row=2, column=0, sticky='ew')
+        bot.grid(row=3, column=0, sticky='ew')
         bot.columnconfigure(0, weight=1)
 
         self.progress = ttk.Progressbar(bot, mode='indeterminate')
@@ -1204,6 +1217,22 @@ class SubtitleApp(_TK_BASE):
         self.time_var = tk.StringVar(value="")
         ttk.Label(bot, textvariable=self.time_var,
                   foreground='#555', font=('Segoe UI', 9)).grid(row=1, column=1, sticky='e')
+
+    # ── OCR QA ─────────────────────────────────────────────────────────────────
+
+    def update_ocr_qa(self, ms: int, text: str):
+        """Append a live OCR capture to the QA panel (call from main thread via after())."""
+        ts = f"{ms // 60000}:{(ms % 60000) // 1000:02d}"
+        line = f"[{ts}]  {text}\n"
+        self.ocr_qa_text.configure(state=tk.NORMAL)
+        self.ocr_qa_text.insert(tk.END, line)
+        self.ocr_qa_text.see(tk.END)
+        self.ocr_qa_text.configure(state=tk.DISABLED)
+
+    def clear_ocr_qa(self):
+        self.ocr_qa_text.configure(state=tk.NORMAL)
+        self.ocr_qa_text.delete('1.0', tk.END)
+        self.ocr_qa_text.configure(state=tk.DISABLED)
 
     # ── Drag and drop ──────────────────────────────────────────────────────────
 
@@ -1735,6 +1764,7 @@ class SubtitleApp(_TK_BASE):
     # ── Pipeline 3: hard-coded OCR ────────────────────────────────────────────
 
     def _process_video_ocr(self, path: str):
+        self.clear_ocr_qa()
         try:
             import cv2
             import pytesseract
@@ -1781,6 +1811,7 @@ class SubtitleApp(_TK_BASE):
                     text = fut.result()
                     if text:
                         raw_ocr.append((ms_val, text))
+                        self.after(0, lambda m=ms_val, t=text: self.update_ocr_qa(m, t))
                 except Exception:
                     pass
 
