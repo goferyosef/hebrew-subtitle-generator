@@ -302,38 +302,51 @@ def _tess_lang() -> str:
 
 def preprocess_for_ocr(region):
     """
-    Returns preprocessing variants to try in order.
+    Returns preprocessing variants to try in order (best-first for typical subtitles).
     Caller stops as soon as one yields a clean result.
     """
     import cv2
     import numpy as np
     gray   = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-    # Fast sharpening — no denoising (too slow for real-time)
     blur   = cv2.GaussianBlur(gray, (3, 3), 0)
     kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
     sharp  = cv2.filter2D(blur, -1, kernel)
-    _, t1  = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, t2  = cv2.threshold(sharp, 190, 255, cv2.THRESH_BINARY)
-    t3     = cv2.adaptiveThreshold(sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+
+    # 1. White-text mask (most common: white subs with black outline)
+    _, white = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+
+    # 2. Otsu on sharpened — works well for high-contrast subs
+    _, otsu  = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # 3. Inverted Otsu — dark-text-on-light-background subs
+    inv = cv2.bitwise_not(otsu)
+
+    # 4. Adaptive threshold — handles uneven lighting/gradient backgrounds
+    adapt  = cv2.adaptiveThreshold(sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                     cv2.THRESH_BINARY, 15, 3)
+
+    # 5. Fixed high threshold — catches bright white on any background
+    _, hi  = cv2.threshold(sharp, 190, 255, cv2.THRESH_BINARY)
+
+    # 6. Yellow mask — yellow subtitle text (some foreign films)
     hsv    = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
     yellow = cv2.inRange(hsv, np.array([15, 80, 80]), np.array([40, 255, 255]))
-    return [t1, t2, t3, yellow]
+
+    return [white, otsu, inv, adapt, hi, yellow]
 
 
 def _subtitle_region(frame, crop_pct: float = 0.20):
-    """Crop bottom crop_pct of frame (subtitle zone), resize to max 960px wide, upscale 2x."""
+    """Crop bottom crop_pct of frame (subtitle zone), upscale to min 120px tall for OCR."""
     import cv2
     h, w   = frame.shape[:2]
     region = frame[int(h * (1.0 - crop_pct)):, :]
     if region.size == 0:
         return None
     rh, rw = region.shape[:2]
-    if rw > 960:
-        scale  = 960 / rw
-        region = cv2.resize(region, (960, max(1, int(rh * scale))),
-                             interpolation=cv2.INTER_AREA)
-    return cv2.resize(region, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    # Upscale so the region is at least 120px tall — guarantees Tesseract has enough pixels
+    scale = max(3.0, 120 / rh)
+    return cv2.resize(region, (int(rw * scale), int(rh * scale)),
+                      interpolation=cv2.INTER_CUBIC)
 
 
 def _region_thumb_hash(frame, crop_pct: float = 0.20) -> str | None:
@@ -357,7 +370,7 @@ def ocr_frame(frame, tess_lang: str = 'eng', crop_pct: float = 0.20) -> str:
     region = _subtitle_region(frame, crop_pct)
     if region is None:
         return ''
-    best, cfg = '', r'--oem 1 --psm 7 -c tessedit_char_blacklist=|~^_'
+    best, cfg = '', r'--oem 1 --psm 6 -c tessedit_char_blacklist=|~^_'
     for img in preprocess_for_ocr(region):
         try:
             raw     = pytesseract.image_to_string(img, config=cfg, lang=tess_lang)
