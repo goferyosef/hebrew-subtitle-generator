@@ -672,10 +672,13 @@ def check_deepl(key: str) -> tuple:
     url = DEEPL_API_URL_FREE if key.endswith(':fx') else DEEPL_API_URL_PAID
     try:
         payload = urllib.parse.urlencode({
-            'auth_key': key, 'text': 'hello', 'target_lang': 'HE'
+            'text': 'hello', 'target_lang': 'HE'
         }).encode()
         req = urllib.request.Request(url, data=payload,
-                                     headers={"Content-Type": "application/x-www-form-urlencoded"},
+                                     headers={
+                                         "Content-Type": "application/x-www-form-urlencoded",
+                                         "Authorization": f"DeepL-Auth-Key {key}",
+                                     },
                                      method="POST")
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status == 200, ""
@@ -699,10 +702,13 @@ def _deepl_translate_lines(indices, clean_texts, results, log_cb, key: str, canc
             return
         try:
             payload = urllib.parse.urlencode({
-                'auth_key': key, 'text': clean_texts[i], 'target_lang': 'HE'
+                'text': clean_texts[i], 'target_lang': 'HE'
             }).encode()
             req = urllib.request.Request(url, data=payload,
-                                         headers={"Content-Type": "application/x-www-form-urlencoded"},
+                                         headers={
+                                             "Content-Type": "application/x-www-form-urlencoded",
+                                             "Authorization": f"DeepL-Auth-Key {key}",
+                                         },
                                          method="POST")
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read())
@@ -1395,13 +1401,16 @@ class SubtitleApp(_TK_BASE):
     # ── Drag and drop ──────────────────────────────────────────────────────────
 
     def _on_drop(self, event):
-        # tkinterdnd2 wraps paths in {} on Windows when there are spaces
-        raw  = event.data.strip()
-        path = re.sub(r'^\{|\}$', '', raw)
-        if Path(path).exists():
-            self._dispatch_file(path)
-        else:
-            self.log(f"Dropped path not found: {path}", 'error')
+        # tkinterdnd2 wraps paths-with-spaces in {} on Windows; multiple files are space-separated
+        raw    = event.data.strip()
+        braced = re.findall(r'\{([^}]+)\}', raw)
+        bare   = re.sub(r'\{[^}]+\}', '', raw).split()
+        paths  = (braced + bare) or [raw]
+        paths  = [p for p in paths if Path(p).exists()][:10]
+        if not paths:
+            self.log(f"Dropped path not found: {raw}", 'error')
+            return
+        self._run_in_thread(self._process_file_queue, paths)
 
     # ── Logging ────────────────────────────────────────────────────────────────
 
@@ -1832,8 +1841,8 @@ class SubtitleApp(_TK_BASE):
     # ── File dispatch ──────────────────────────────────────────────────────────
 
     def _open_file(self):
-        path = filedialog.askopenfilename(
-            title="Select subtitle or video file",
+        paths = filedialog.askopenfilenames(
+            title="Select subtitle or video files (up to 10)",
             filetypes=[
                 ("All supported", " ".join(f"*{e}" for e in sorted(SUBTITLE_EXTS | VIDEO_EXTS))),
                 ("Subtitle files", " ".join(f"*{e}" for e in sorted(SUBTITLE_EXTS))),
@@ -1841,18 +1850,36 @@ class SubtitleApp(_TK_BASE):
                 ("All files", "*.*"),
             ]
         )
-        if path:
-            self._dispatch_file(path)
+        if not paths:
+            return
+        paths = list(paths)
+        if len(paths) > 10:
+            messagebox.showwarning("Too many files",
+                f"{len(paths)} files selected — only the first 10 will be processed.")
+            paths = paths[:10]
+        self._run_in_thread(self._process_file_queue, paths)
 
-    def _dispatch_file(self, path: str):
-        self.file_var.set(Path(path).name)
-        ext = Path(path).suffix.lower()
-        if ext in SUBTITLE_EXTS:
-            self._run_in_thread(self._process_subtitle_file, path)
-        elif ext in VIDEO_EXTS:
-            self._run_in_thread(self._process_video_file, path)
-        else:
-            messagebox.showerror("Unsupported", f"Unknown file type: {ext}")
+    def _process_file_queue(self, paths: list):
+        total = len(paths)
+        for i, path in enumerate(paths, 1):
+            if self._should_cancel():
+                self.log(f"Queue cancelled ({i - 1}/{total} done).", 'warning')
+                return
+            label = f"[{i}/{total}] " if total > 1 else ""
+            self.after(0, lambda n=Path(path).name, lbl=label: self.file_var.set(f"{lbl}{n}"))
+            if total > 1:
+                self.log(f"{'─' * 36}")
+                self.log(f"File {i}/{total}: {Path(path).name}")
+            ext = Path(path).suffix.lower()
+            if ext in SUBTITLE_EXTS:
+                self._process_subtitle_file(path)
+            elif ext in VIDEO_EXTS:
+                self._process_video_file(path)
+            else:
+                self.log(f"Unsupported file type: {ext}", 'error')
+        if total > 1 and not self._should_cancel():
+            self.log(f"{'─' * 36}")
+            self.log(f"All {total} files complete.", 'success')
 
     # ── Sync workflow ──────────────────────────────────────────────────────────
 
