@@ -761,8 +761,8 @@ def _parse_llm_json(response: str, n: int) -> list:
     def _pad(items):
         return (items + [''] * n)[:n]
 
-    # 1. JSON array directly
-    m = re.search(r'\[[\s\S]*?\]', text)
+    # 1. JSON array directly (greedy — capture the full array, not just up to the first ])
+    m = re.search(r'\[[\s\S]*\]', text)
     if m:
         try:
             parsed = json.loads(m.group())
@@ -856,10 +856,11 @@ def _ai_parallel_translate(raw_texts: list, providers: list,
     Divide lines evenly across all providers and translate in parallel threads.
     Quota/failures for a section fall back to DeepL (if key set) or Google Translate.
     """
-    clean_texts = [strip_sub_tags(t) for t in raw_texts]
-    results     = list(raw_texts)
-    total       = len(raw_texts)
-    pending     = [i for i in range(total) if clean_texts[i].strip()]
+    clean_texts      = [strip_sub_tags(t) for t in raw_texts]
+    results          = list(raw_texts)
+    translated_mask  = [False] * len(raw_texts)
+    total            = len(raw_texts)
+    pending          = [i for i in range(total) if clean_texts[i].strip()]
 
     # Single gender detection pass using first provider
     log_cb("  Detecting character genders…", 'dim')
@@ -901,15 +902,28 @@ def _ai_parallel_translate(raw_texts: list, providers: list,
             for attempt in range(4):
                 try:
                     translated = _ai_translate_batch(batch_texts, chat_fn, system, context_win)
+                    missing_idx = []
                     with lock:
                         for i, heb in zip(batch_idx, translated):
                             if heb:
                                 results[i] = RTL_MARK + heb
+                                translated_mask[i] = True
                                 context_win.append(heb)
+                            else:
+                                missing_idx.append(i)  # AI left this slot empty
                         context_win[:] = context_win[-AI_CONTEXT:]
                         done_ref[0] += sum(1 for h in translated if h)
                         if progress_cb:
                             progress_cb(done_ref[0], total)
+                    # Immediately fall back for any empty slots the AI skipped
+                    if missing_idx:
+                        log_cb(f"  [{label}] {len(missing_idx)} partial slots → fallback", 'dim')
+                        _google_translate_lines(missing_idx, clean_texts, results, log_cb,
+                                                cancel_check, deepl_key=deepl_key)
+                        with lock:
+                            for i in missing_idx:
+                                if results[i] != raw_texts[i]:
+                                    translated_mask[i] = True
                     succeeded = True
                     break
                 except urllib.error.HTTPError as e:
@@ -938,13 +952,20 @@ def _ai_parallel_translate(raw_texts: list, providers: list,
                         log_cb(f"  [{label}] parse error on batch {batch_num}, skipping", 'warning')
                         break
                 except Exception as e:
-                    log_cb(f"  [{label}] batch {batch_num} error: {e}", 'warning')
-                    break
+                    if attempt < 3:
+                        log_cb(f"  [{label}] batch {batch_num} error ({e}), retry {attempt+1}/3…", 'dim')
+                        time.sleep(5 * (attempt + 1))
+                    else:
+                        log_cb(f"  [{label}] batch {batch_num} failed ({e})", 'warning')
+                        break
 
             if not succeeded and not cancel_check():
                 _google_translate_lines(batch_idx, clean_texts, results, log_cb, cancel_check,
                                         deepl_key=deepl_key)
                 with lock:
+                    for i in batch_idx:
+                        if results[i] != raw_texts[i]:
+                            translated_mask[i] = True
                     done_ref[0] += len(batch_idx)
                     if progress_cb:
                         progress_cb(done_ref[0], total)
@@ -959,6 +980,15 @@ def _ai_parallel_translate(raw_texts: list, providers: list,
         t.start()
     for t in threads:
         t.join()
+
+    # Final sweep — catch any slots still untranslated (e.g. thread errors)
+    remaining = [i for i, done in enumerate(translated_mask)
+                 if not done and clean_texts[i].strip()]
+    if remaining:
+        fb = "DeepL" if deepl_key else "Google Translate"
+        log_cb(f"  Final sweep: {len(remaining)} untranslated lines → {fb}", 'dim')
+        _google_translate_lines(remaining, clean_texts, results, log_cb, cancel_check,
+                                deepl_key=deepl_key)
 
     if progress_cb:
         progress_cb(total, total)
@@ -1012,12 +1042,23 @@ def _ai_chain_translate(raw_texts: list, providers: list,
             for attempt in range(4):
                 try:
                     translated = _ai_translate_batch(batch_texts, chat_fn, system, context_window)
+                    missing_idx = []
                     for i, heb in zip(batch_idx, translated):
-                        if heb:  # empty string = parser returned partial; skip slot
+                        if heb:
                             results[i]         = RTL_MARK + heb
                             translated_mask[i] = True
                             context_window.append(heb)
+                        else:
+                            missing_idx.append(i)   # AI returned empty — needs fallback
                     context_window = context_window[-AI_CONTEXT:]
+                    # Immediately fall back to Google for any slots the AI left empty
+                    if missing_idx:
+                        log_cb(f"  [{label}] {len(missing_idx)} partial slots → fallback", 'dim')
+                        _google_translate_lines(missing_idx, clean_texts, results, log_cb,
+                                                cancel_check, deepl_key=deepl_key)
+                        for i in missing_idx:
+                            if results[i] != raw_texts[i]:
+                                translated_mask[i] = True
                     break
                 except urllib.error.HTTPError as e:
                     if e.code == 429 and _is_quota_exhausted(e):
@@ -1030,16 +1071,33 @@ def _ai_chain_translate(raw_texts: list, providers: list,
                         time.sleep(wait)
                     else:
                         log_cb(f"  [{label}] batch {batch_num} failed ({e})", 'warning')
+                        if attempt == 3:
+                            _google_translate_lines(batch_idx, clean_texts, results, log_cb,
+                                                    cancel_check, deepl_key=deepl_key)
                         break
                 except ValueError:
                     if attempt < 3:
                         time.sleep(3 * (attempt + 1))
                     else:
-                        log_cb(f"  [{label}] parse error on batch {batch_num}, skipping", 'warning')
+                        log_cb(f"  [{label}] parse error on batch {batch_num} → fallback", 'warning')
+                        _google_translate_lines(batch_idx, clean_texts, results, log_cb,
+                                                cancel_check, deepl_key=deepl_key)
+                        for i in batch_idx:
+                            if results[i] != raw_texts[i]:
+                                translated_mask[i] = True
                         break
                 except Exception as e:
-                    log_cb(f"  [{label}] batch {batch_num} failed ({e})", 'warning')
-                    break
+                    if attempt < 3:
+                        log_cb(f"  [{label}] batch {batch_num} error ({e}), retry {attempt+1}/3…", 'dim')
+                        time.sleep(5 * (attempt + 1))
+                    else:
+                        log_cb(f"  [{label}] batch {batch_num} failed ({e}) → fallback", 'warning')
+                        _google_translate_lines(batch_idx, clean_texts, results, log_cb,
+                                                cancel_check, deepl_key=deepl_key)
+                        for i in batch_idx:
+                            if results[i] != raw_texts[i]:
+                                translated_mask[i] = True
+                        break
 
             if quota_hit:
                 break
