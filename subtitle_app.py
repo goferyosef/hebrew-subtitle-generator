@@ -299,64 +299,15 @@ class OcrLine:
     last_ms: int
 
 
-def _tess_lang() -> str:
-    """Return best available Tesseract language combo (prefers common subtitle languages)."""
-    try:
-        import pytesseract
-        available = set(pytesseract.get_languages(config=''))
-        wanted = ['eng', 'heb', 'ara', 'rus', 'spa', 'fra', 'deu', 'ita', 'por',
-                  'chi_sim', 'jpn', 'kor']
-        langs = [l for l in wanted if l in available]
-        return '+'.join(langs) if langs else 'eng'
-    except Exception:
-        return 'eng'
-
-
-def preprocess_for_ocr(region):
-    """
-    Returns preprocessing variants to try in order (best-first for typical subtitles).
-    Caller stops as soon as one yields a clean result.
-    """
-    import cv2
-    import numpy as np
-    gray   = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-    blur   = cv2.GaussianBlur(gray, (3, 3), 0)
-    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
-    sharp  = cv2.filter2D(blur, -1, kernel)
-
-    # 1. White-text mask (most common: white subs with black outline)
-    _, white = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-
-    # 2. Otsu on sharpened — works well for high-contrast subs
-    _, otsu  = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # 3. Inverted Otsu — dark-text-on-light-background subs
-    inv = cv2.bitwise_not(otsu)
-
-    # 4. Adaptive threshold — handles uneven lighting/gradient backgrounds
-    adapt  = cv2.adaptiveThreshold(sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                    cv2.THRESH_BINARY, 15, 3)
-
-    # 5. Fixed high threshold — catches bright white on any background
-    _, hi  = cv2.threshold(sharp, 190, 255, cv2.THRESH_BINARY)
-
-    # 6. Yellow mask — yellow subtitle text (some foreign films)
-    hsv    = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
-    yellow = cv2.inRange(hsv, np.array([15, 80, 80]), np.array([40, 255, 255]))
-
-    return [white, otsu, inv, adapt, hi, yellow]
-
-
 def _subtitle_region(frame, crop_pct: float = 0.20):
-    """Crop bottom crop_pct of frame (subtitle zone), upscale to min 120px tall for OCR."""
+    """Crop bottom crop_pct of frame (subtitle zone), upscale to min 80px tall for OCR."""
     import cv2
     h, w   = frame.shape[:2]
     region = frame[int(h * (1.0 - crop_pct)):, :]
     if region.size == 0:
         return None
     rh, rw = region.shape[:2]
-    # Upscale so the region is at least 120px tall — guarantees Tesseract has enough pixels
-    scale = max(3.0, 120 / rh)
+    scale = max(2.0, 80 / rh)
     return cv2.resize(region, (int(rw * scale), int(rh * scale)),
                       interpolation=cv2.INTER_CUBIC)
 
@@ -377,48 +328,28 @@ def _region_thumb_hash(frame, crop_pct: float = 0.20) -> str | None:
     return hashlib.md5(mask.tobytes()).hexdigest()
 
 
-def _ocr_score(text: str) -> float:
-    """
-    Score OCR output quality: 0.0 = gibberish, 1.0 = clean text.
-    Penalises symbol noise and rewards word-like tokens.
-    Returns -1.0 to reject outright.
-    """
-    if not text or len(text) < 3:
-        return -1.0
-    # Reject if more than 20% non-text characters
-    sym = sum(1 for c in text if not (c.isalpha() or c in " ,.!?'-–—:;\"()")) / len(text)
-    if sym > 0.20:
-        return -1.0
-    # Must contain at least one word of 2+ alpha chars
-    words = re.findall(r'[A-Za-z\u0590-\u05FF]{2,}', text)
-    if not words:
-        return -1.0
-    # Score = word coverage (alpha chars / total non-space chars)
-    alpha = sum(len(w) for w in words)
-    total = max(len(text.replace(' ', '')), 1)
-    return alpha / total
+# Thread-local PaddleOCR instances — one per worker thread (PaddleOCR is not thread-safe to share)
+_tls = threading.local()
+
+def _get_paddle_ocr():
+    if not hasattr(_tls, 'ocr'):
+        from paddleocr import PaddleOCR
+        _tls.ocr = PaddleOCR(use_angle_cls=False, lang='en', show_log=False)
+    return _tls.ocr
 
 
-def ocr_frame(frame, tess_lang: str = 'eng', crop_pct: float = 0.20) -> str:
-    import pytesseract
+def ocr_frame(frame, crop_pct: float = 0.20) -> str:
     region = _subtitle_region(frame, crop_pct)
     if region is None:
         return ''
-    cfg  = r'--oem 1 --psm 6 -c tessedit_char_blacklist=|~^_\/'
-    best_text, best_score = '', -1.0
-    for img in preprocess_for_ocr(region):
-        try:
-            raw     = pytesseract.image_to_string(img, config=cfg, lang=tess_lang)
-            cleaned = ' '.join(raw.split())
-            score   = _ocr_score(cleaned)
-            if score > best_score:
-                best_score = score
-                best_text  = cleaned
-                if best_score >= 0.85:   # High confidence — stop early
-                    break
-        except Exception:
-            continue
-    return best_text if best_score >= 0.0 else ''
+    try:
+        result = _get_paddle_ocr().ocr(region, cls=False)
+        if not result or not result[0]:
+            return ''
+        lines = [line[1][0] for line in result[0] if line[1][1] >= 0.6]
+        return ' '.join(lines).strip()
+    except Exception:
+        return ''
 
 
 def deduplicate_ocr_lines(raw: list) -> list:
@@ -1542,8 +1473,7 @@ class SubtitleApp(_TK_BASE):
     def _check_dependencies(self):
         self.log("Checking dependencies…", 'dim')
 
-        for binary, label in [('ffmpeg', 'ffmpeg'), ('ffprobe', 'ffprobe'),
-                               ('tesseract', 'Tesseract OCR')]:
+        for binary, label in [('ffmpeg', 'ffmpeg'), ('ffprobe', 'ffprobe')]:
             try:
                 run_cmd(binary, '-version', timeout=5)
                 self.log(f"  ✓ {label}", 'success')
@@ -1554,7 +1484,7 @@ class SubtitleApp(_TK_BASE):
             ('pysubs2',         'pysubs2'),
             ('deep-translator', 'deep_translator'),
             ('opencv-python',   'cv2'),
-            ('pytesseract',     'pytesseract'),
+            ('paddleocr',       'paddleocr'),
             ('chardet',         'chardet'),
             ('ffsubsync',       'ffsubsync'),
             ('tkinterdnd2',     'tkinterdnd2'),
@@ -2132,11 +2062,10 @@ class SubtitleApp(_TK_BASE):
         self.clear_ocr_qa()
         try:
             import cv2
-            import pytesseract
+            from paddleocr import PaddleOCR  # noqa: F401
         except ImportError:
-            self.log("OCR requires opencv-python + pytesseract", 'error')
-            self.log("  pip install opencv-python pytesseract", 'error')
-            self.log("  Tesseract: https://github.com/UB-Mannheim/tesseract/wiki", 'error')
+            self.log("OCR requires opencv-python + paddleocr", 'error')
+            self.log("  pip install opencv-python paddleocr", 'error')
             return
 
         p   = Path(path)
@@ -2150,11 +2079,10 @@ class SubtitleApp(_TK_BASE):
         duration_ms = int((total_f / fps) * 1000)
         dur_str     = f"{duration_ms // 60000}m {(duration_ms % 60000) // 1000}s"
 
-        tess_lang = _tess_lang()
         crop_pct  = self.ocr_crop_var.get() / 100.0
         self.log(f"Video: {dur_str}  ({total_f:,} frames @ {fps:.1f} fps)")
-        self.log(f"OCR language(s): {tess_lang}  |  crop zone: bottom {self.ocr_crop_var.get()}%", 'dim')
-        self.log("Scanning at 1 fps — text-aware change detection + 2 parallel OCR workers…", 'warning')
+        self.log(f"OCR engine: PaddleOCR  |  crop zone: bottom {self.ocr_crop_var.get()}%", 'dim')
+        self.log("Scanning at 1 fps — text-aware change detection + 3 parallel OCR workers…", 'warning')
 
         from concurrent.futures import ThreadPoolExecutor
 
@@ -2201,7 +2129,7 @@ class SubtitleApp(_TK_BASE):
 
                 # Submit to thread pool; limit queue depth to avoid memory bloat
                 _flush_pending(block_until=OCR_WORKERS * 3)
-                pending.append((ms, pool.submit(ocr_frame, frame.copy(), tess_lang, crop_pct)))
+                pending.append((ms, pool.submit(ocr_frame, frame.copy(), crop_pct)))
                 ocr_calls += 1
 
                 self.set_job_progress(ms, duration_ms)
