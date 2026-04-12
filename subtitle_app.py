@@ -328,13 +328,13 @@ def _region_thumb_hash(frame, crop_pct: float = 0.20) -> str | None:
     return hashlib.md5(mask.tobytes()).hexdigest()
 
 
-# Thread-local PaddleOCR instances — one per worker thread (PaddleOCR is not thread-safe to share)
+# Thread-local RapidOCR instances — one per worker thread
 _tls = threading.local()
 
-def _get_paddle_ocr():
+def _get_rapid_ocr():
     if not hasattr(_tls, 'ocr'):
-        from paddleocr import PaddleOCR
-        _tls.ocr = PaddleOCR(use_angle_cls=False, lang='en', show_log=False)
+        from rapidocr_onnxruntime import RapidOCR
+        _tls.ocr = RapidOCR()
     return _tls.ocr
 
 
@@ -343,10 +343,11 @@ def ocr_frame(frame, crop_pct: float = 0.20) -> str:
     if region is None:
         return ''
     try:
-        result = _get_paddle_ocr().ocr(region, cls=False)
-        if not result or not result[0]:
+        result, _ = _get_rapid_ocr()(region)
+        if not result:
             return ''
-        lines = [line[1][0] for line in result[0] if line[1][1] >= 0.6]
+        # result entries: [bbox, text, confidence_str]
+        lines = [line[1] for line in result if float(line[2]) >= 0.6]
         return ' '.join(lines).strip()
     except Exception:
         return ''
@@ -1484,7 +1485,7 @@ class SubtitleApp(_TK_BASE):
             ('pysubs2',         'pysubs2'),
             ('deep-translator', 'deep_translator'),
             ('opencv-python',   'cv2'),
-            ('paddleocr',       'paddleocr'),
+            ('rapidocr-onnxruntime', 'rapidocr_onnxruntime'),
             ('chardet',         'chardet'),
             ('ffsubsync',       'ffsubsync'),
             ('tkinterdnd2',     'tkinterdnd2'),
@@ -2062,10 +2063,10 @@ class SubtitleApp(_TK_BASE):
         self.clear_ocr_qa()
         try:
             import cv2
-            from paddleocr import PaddleOCR  # noqa: F401
+            from rapidocr_onnxruntime import RapidOCR  # noqa: F401
         except ImportError:
-            self.log("OCR requires opencv-python + paddleocr", 'error')
-            self.log("  pip install opencv-python paddleocr", 'error')
+            self.log("OCR requires opencv-python + rapidocr-onnxruntime", 'error')
+            self.log("  pip install opencv-python rapidocr-onnxruntime", 'error')
             return
 
         p   = Path(path)
@@ -2081,7 +2082,7 @@ class SubtitleApp(_TK_BASE):
 
         crop_pct  = self.ocr_crop_var.get() / 100.0
         self.log(f"Video: {dur_str}  ({total_f:,} frames @ {fps:.1f} fps)")
-        self.log(f"OCR engine: PaddleOCR  |  crop zone: bottom {self.ocr_crop_var.get()}%", 'dim')
+        self.log(f"OCR engine: RapidOCR  |  crop zone: bottom {self.ocr_crop_var.get()}%", 'dim')
         self.log("Scanning at 1 fps — text-aware change detection + 3 parallel OCR workers…", 'warning')
 
         from concurrent.futures import ThreadPoolExecutor
