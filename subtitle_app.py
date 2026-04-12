@@ -347,7 +347,13 @@ def ocr_frame(frame, crop_pct: float = 0.20) -> str:
         if not result:
             return ''
         # result entries: [bbox, text, confidence_str]
-        lines = [line[1] for line in result if float(line[2]) >= 0.6]
+        # Threshold 0.35: subtitle text on compressed/stylised video often scores below 0.6.
+        # Word filter guards against single-glyph noise at the lower confidence bar.
+        lines = [
+            line[1] for line in result
+            if float(line[2]) >= 0.35
+            and re.search(r'[A-Za-z\u0590-\u05FF\u0600-\u06FF]{2,}', line[1])
+        ]
         return ' '.join(lines).strip()
     except Exception:
         return ''
