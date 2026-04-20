@@ -1213,6 +1213,35 @@ def translate_and_save(subs, out_path: str, log_cb,
     log_cb(f"Saved: {Path(out_path).name}", 'success')
 
 
+# ─── Tooltip helper ───────────────────────────────────────────────────────────
+
+class _Tooltip:
+    """Show a small tooltip window when hovering over a widget."""
+    def __init__(self, widget, text: str):
+        self._widget = widget
+        self._text   = text
+        self._win    = None
+        widget.bind('<Enter>', self._show, add='+')
+        widget.bind('<Leave>', self._hide, add='+')
+
+    def _show(self, event=None):
+        if self._win:
+            return
+        x = self._widget.winfo_rootx() + 20
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+        self._win = tw = tk.Toplevel(self._widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tk.Label(tw, text=self._text, justify='left',
+                 background='#ffffe0', relief='solid', borderwidth=1,
+                 font=('Segoe UI', 8), wraplength=280, padx=5, pady=3).pack()
+
+    def _hide(self, event=None):
+        if self._win:
+            self._win.destroy()
+            self._win = None
+
+
 # ─── Main GUI Application ─────────────────────────────────────────────────────
 
 class SubtitleApp(_TK_BASE):
@@ -1309,13 +1338,13 @@ class SubtitleApp(_TK_BASE):
             )
 
         # ── OCR crop zone slider ──
-        self.ocr_crop_var = tk.IntVar(value=20)
+        self.ocr_crop_var = tk.IntVar(value=33)
         ttk.Label(top, text="OCR crop zone:",
                   font=('Segoe UI', 8)).grid(row=3, column=0, sticky='e', padx=(0, 4), pady=(4, 0))
         crop_slider = ttk.Scale(top, from_=10, to=50, orient='horizontal',
                                 variable=self.ocr_crop_var, length=130)
         crop_slider.grid(row=3, column=1, columnspan=2, sticky='w', pady=(4, 0))
-        self.ocr_crop_lbl = ttk.Label(top, text="20% of frame height",
+        self.ocr_crop_lbl = ttk.Label(top, text="33% of frame height",
                                       font=('Segoe UI', 8), foreground='#666')
         self.ocr_crop_lbl.grid(row=3, column=3, sticky='w', padx=(4, 0), pady=(4, 0))
 
@@ -1377,6 +1406,53 @@ class SubtitleApp(_TK_BASE):
         self.time_var = tk.StringVar(value="")
         ttk.Label(bot, textvariable=self.time_var,
                   foreground='#555', font=('Segoe UI', 9)).grid(row=1, column=1, sticky='e')
+
+        self._add_tooltips(crop_slider)
+
+    def _add_tooltips(self, crop_slider):
+        _Tooltip(self.open_btn,
+                 "Open a file to process.\n"
+                 "• Subtitle file (.srt/.ass/.vtt/…) → translate to Hebrew\n"
+                 "• Video with soft (embedded) subtitles → extract & translate\n"
+                 "• Video with hard-coded (burned-in) subtitles → OCR & translate")
+        _Tooltip(self.sync_btn,
+                 "Sync an existing subtitle file to a video.\n"
+                 "Aligns subtitle timing to the movie audio using ffsubsync.\n"
+                 "Useful when subtitles are correct but out of sync.")
+        _Tooltip(self.cancel_btn,
+                 "Cancel the currently running job.")
+        _Tooltip(self.groq_btn,
+                 "Set your free Groq API key.\n"
+                 "Powers gender-aware Hebrew translation via Llama 3.3 70B.\n"
+                 "Get a free key at: https://console.groq.com")
+        _Tooltip(self.gemini_btn,
+                 "Set your free Gemini API key.\n"
+                 "Fast & accurate Hebrew translation via Gemini 2.0 Flash.\n"
+                 "Get a free key at: https://aistudio.google.com/apikey")
+        _Tooltip(self.cerebras_btn,
+                 "Set your free Cerebras API key.\n"
+                 "Fastest available AI translation (wafer-scale inference).\n"
+                 "Get a free key at: https://cloud.cerebras.ai")
+        _Tooltip(self.mistral_btn,
+                 "Set your free Mistral API key.\n"
+                 "Additional AI translation engine (free tier available).\n"
+                 "Get a free key at: https://console.mistral.ai")
+        _Tooltip(self.deepl_btn,
+                 "Set your DeepL API key.\n"
+                 "High-quality neural translation, 500K chars/month free.\n"
+                 "Get a free key at: https://www.deepl.com/pro-api")
+        _Tooltip(self.trans_combo,
+                 "Choose the translation backend:\n"
+                 "• AI mode — gender-aware Hebrew using your AI keys.\n"
+                 "  Multiple keys = parallel translation (faster).\n"
+                 "• DeepL — neural translation (requires DeepL key).\n"
+                 "• Google Translate — free fallback, no key needed.")
+        _Tooltip(crop_slider,
+                 "OCR crop zone: percentage of the frame height scanned\n"
+                 "from the bottom for subtitle text.\n"
+                 "• 33% covers most subtitle positions (default).\n"
+                 "• Increase if subtitles appear higher up in the frame.\n"
+                 "• Decrease to speed up OCR on widescreen content.")
 
     # ── OCR QA ─────────────────────────────────────────────────────────────────
 
