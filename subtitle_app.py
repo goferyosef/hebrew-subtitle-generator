@@ -115,28 +115,28 @@ AI_CONFIG_PATH = Path.home() / ".hebrew_subtitle_config.json"
 # Cerebras (fastest inference — https://cloud.cerebras.ai)
 CEREBRAS_API_URL   = "https://api.cerebras.ai/v1/chat/completions"
 CEREBRAS_MODEL     = "gpt-oss-120b"
-CEREBRAS_BATCH_SIZE  = 10
-CEREBRAS_BATCH_DELAY = 0.5   # wafer-scale chips — very fast, minimal delay needed
+CEREBRAS_BATCH_SIZE  = 6    # smaller batches → more focused, higher-quality output
+CEREBRAS_BATCH_DELAY = 0.5
 CEREBRAS_TIMEOUT     = 60
 
 # Gemini Flash (free — https://aistudio.google.com, 15 RPM, 1M tokens/day)
 GEMINI_API_BASE    = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_MODEL       = "gemini-2.0-flash"
-GEMINI_BATCH_SIZE  = 20
+GEMINI_BATCH_SIZE  = 8
 GEMINI_BATCH_DELAY = 1.0
 GEMINI_TIMEOUT     = 60
 
 # Groq (free cloud AI — https://console.groq.com)
 GROQ_API_URL     = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL       = "llama-3.3-70b-versatile"
-GROQ_BATCH_SIZE  = 10
+GROQ_BATCH_SIZE  = 6
 GROQ_BATCH_DELAY = 2.0
 GROQ_TIMEOUT     = 60
 
 # Mistral (free tier — https://console.mistral.ai)
 MISTRAL_API_URL   = "https://api.mistral.ai/v1/chat/completions"
 MISTRAL_MODEL     = "mistral-small-latest"
-MISTRAL_BATCH_SIZE  = 15
+MISTRAL_BATCH_SIZE  = 6
 MISTRAL_BATCH_DELAY = 1.0
 MISTRAL_TIMEOUT     = 60
 
@@ -144,7 +144,7 @@ MISTRAL_TIMEOUT     = 60
 DEEPL_API_URL_FREE = "https://api-free.deepl.com/v2/translate"
 DEEPL_API_URL_PAID = "https://api.deepl.com/v2/translate"
 
-AI_CONTEXT = 20   # lines of prior context kept for gender consistency
+AI_CONTEXT = 50   # lines of prior context kept for gender consistency
 
 # Hebrew RTL marker — prepended to each translated line so players display it correctly
 RTL_MARK = '\u200f'
@@ -159,13 +159,18 @@ TRANSLATION RULES — follow these exactly:
     Addressing a FEMALE:  את,  שלך (f), עשית (f), הלכת (f)
     Speaking ABOUT a male:   הוא, שלו, עשה, הלך, טוב, גדול
     Speaking ABOUT a female: היא, שלה, עשתה, הלכה, טובה, גדולה
-- Infer gender of who is SPEAKING and who is SPOKEN TO from the context provided
-- Maintain consistent gender for each character — do NOT switch mid-scene
-- Keep translations concise — subtitles must be readable in 1–2 seconds
-- Preserve register: slang stays slangy, formal stays formal, urgency stays urgent
-- Swear words → use natural Hebrew equivalents, do not soften them
-- Do NOT transliterate English words that have common Hebrew equivalents
-- Return ONLY a valid JSON array of translated strings — no explanation, no markdown
+- Infer gender of who is SPEAKING and who is SPOKEN TO from context; maintain it consistently
+- Use NATURAL Israeli expressions — avoid literal word-for-word calques from English syntax:
+    BAD: "זה עושה שכל" (calque) → GOOD: "זה הגיוני" / "זה מובן"
+    BAD: "לקבל החלטה" → GOOD: "להחליט"
+    BAD: "אני מרגיש שאתה צריך" → GOOD: "נדמה לי שאתה צריך" / "אני חושב שאתה צריך"
+- Match the register and energy of the original: street slang → colloquial Israeli; formal → formal but not archaic
+- Swear words → use natural Hebrew equivalents at the SAME intensity — do NOT soften or omit them
+- Do NOT transliterate English words that have well-known Hebrew equivalents
+- Do NOT leave any subtitle untranslated — every line must be rendered in Hebrew
+- Do NOT add or remove punctuation, quotation marks, or dashes not present in the original
+- Keep translations concise — subtitles must be readable in 1–2 seconds per line
+- Return ONLY a valid JSON array of exactly the right number of Hebrew strings — no explanation, no markdown
 
 {gender_block}"""
 
@@ -659,19 +664,20 @@ def _deepl_translate_lines(indices, clean_texts, results, log_cb, key: str, canc
 def detect_character_genders(sample_texts: list, chat_fn, log_cb) -> str:
     if not sample_texts:
         return ""
-    # Sample evenly across the whole file (up to 80 lines) for better coverage
-    step    = max(1, len(sample_texts) // 80)
-    sampled = [sample_texts[i] for i in range(0, len(sample_texts), step)][:80]
+    # Sample evenly across the whole file (up to 150 lines) for better coverage
+    step    = max(1, len(sample_texts) // 150)
+    sampled = [sample_texts[i] for i in range(0, len(sample_texts), step)][:150]
     numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(sampled))
     user_msg = (
-        "Read these subtitle lines and identify character names and their genders.\n"
-        "Return ONLY JSON: {\"characters\": [{\"name\": \"...\", \"gender\": \"male|female|unknown\"}, ...]}\n"
+        "Read these subtitle lines and identify ALL named characters, their genders, "
+        "and their apparent role (e.g. detective, teenager, doctor, soldier) if determinable.\n"
+        "Return ONLY JSON: {\"characters\": [{\"name\": \"...\", \"gender\": \"male|female|unknown\", \"role\": \"...\"}, ...]}\n"
         "If no character names are detectable, return {\"characters\": []}\n\n"
         f"Lines:\n{numbered}"
     )
     try:
         response = chat_fn(
-            "You are a script analyst. Identify character names and genders from dialogue. Return only valid JSON.",
+            "You are a script analyst. Identify character names, genders, and roles from dialogue. Return only valid JSON.",
             user_msg,
         )
         m = re.search(r'\{[\s\S]*\}', response)
@@ -682,7 +688,11 @@ def detect_character_genders(sample_texts: list, chat_fn, log_cb) -> str:
             if chars:
                 summary  = ', '.join(f"{c['name']} ({c['gender']})" for c in chars)
                 log_cb(f"  Characters: {summary}", 'dim')
-                char_list = '\n'.join(f"  - {c['name']}: {c['gender']}" for c in chars)
+                char_list = '\n'.join(
+                    f"  - {c['name']}: {c['gender']}"
+                    + (f" ({c['role']})" if c.get('role') else '')
+                    for c in chars
+                )
                 return (
                     "CHARACTER GENDERS (use correct Hebrew gender forms when these characters "
                     "speak or are spoken to):\n" + char_list
@@ -745,8 +755,14 @@ def _parse_llm_json(response: str, n: int) -> list:
 def _ai_translate_batch(texts: list, chat_fn, system: str, context_window: list) -> list:
     ctx = ""
     if context_window:
-        ctx = "RECENT CONTEXT (already translated — reference only, do NOT retranslate):\n"
-        ctx += "\n".join(f"  {t}" for t in context_window) + "\n\n"
+        ctx = "RECENT CONTEXT (already translated — for style/gender/tone reference only, do NOT retranslate):\n"
+        for entry in context_window:
+            if isinstance(entry, tuple):
+                eng, heb = entry
+                ctx += f"  [{eng}] → [{heb}]\n"
+            else:
+                ctx += f"  {entry}\n"
+        ctx += "\n"
     numbered = "\n".join(f'{i+1}. "{t}"' for i, t in enumerate(texts))
     user_msg  = (
         f"{ctx}Translate these {len(texts)} subtitle lines to Hebrew.\n"
@@ -846,7 +862,7 @@ def _ai_parallel_translate(raw_texts: list, providers: list,
                             if heb:
                                 results[i] = RTL_MARK + heb
                                 translated_mask[i] = True
-                                context_win.append(heb)
+                                context_win.append((clean_texts[i], heb))
                             else:
                                 missing_idx.append(i)  # AI left this slot empty
                         context_win[:] = context_win[-AI_CONTEXT:]
@@ -985,7 +1001,7 @@ def _ai_chain_translate(raw_texts: list, providers: list,
                         if heb:
                             results[i]         = RTL_MARK + heb
                             translated_mask[i] = True
-                            context_window.append(heb)
+                            context_window.append((clean_texts[i], heb))
                         else:
                             missing_idx.append(i)   # AI returned empty — needs fallback
                     context_window = context_window[-AI_CONTEXT:]
@@ -1177,15 +1193,10 @@ def translate_and_save(subs, out_path: str, log_cb,
 
     if providers:
         fallback_label = "DeepL" if deepl_key else "Google Translate"
-        if len(providers) >= 2:
-            labels = ' | '.join(p['label'] for p in providers)
-            log_cb(f"  AI parallel: {labels} (+ {fallback_label} fallback)")
-            translated = _ai_parallel_translate(raw_texts, providers, log_cb, cancel_check,
-                                                progress_cb, deepl_key=deepl_key)
-        else:
-            log_cb(f"  AI: {providers[0]['label']} → {fallback_label}")
-            translated = _ai_chain_translate(raw_texts, providers, log_cb, cancel_check,
-                                             progress_cb, deepl_key=deepl_key)
+        labels = ' → '.join(p['label'] for p in providers)
+        log_cb(f"  AI quality mode: {labels} (+ {fallback_label} fallback)")
+        translated = _ai_chain_translate(raw_texts, providers, log_cb, cancel_check,
+                                         progress_cb, deepl_key=deepl_key)
     else:
         if deepl_key:
             log_cb("  DeepL (free tier)")
@@ -1659,11 +1670,7 @@ class SubtitleApp(_TK_BASE):
             if self.groq_key:     chain.append("Groq")
             if self.mistral_key:  chain.append("Mistral")
             chain.append("DeepL" if self.deepl_key else "Google")
-            n_ai = sum([bool(self.cerebras_key), bool(self.gemini_key),
-                        bool(self.groq_key), bool(self.mistral_key)])
-            mode = "parallel" if n_ai >= 2 else "single"
-            sep  = " | " if n_ai >= 2 else " → "
-            options = [f"AI {mode} ({sep.join(chain)})"] if has_ai else []
+            options = [f"AI quality ({' → '.join(chain)})"] if has_ai else []
             if self.deepl_key:
                 options.append("DeepL (free tier)")
             options.append("Google Translate (free)")
